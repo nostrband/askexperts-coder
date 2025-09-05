@@ -1,0 +1,32 @@
+{
+  "name": "askexperts-hacker",
+  "version": "1.0.0",
+  "description": "AI agent that analyzes TypeScript source codebases to produce searchable documentation",
+  "license": "MIT",
+  "author": "",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "askexperts-hacker": "./dist/bin/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/bin/index.js",
+    "dev": "ts-node src/bin/index.ts",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "askexperts": "^0.7.94",
+    "commander": "^11.0.0",
+    "debug": "^4.4.1",
+    "nostr-tools": "^2.16.2",
+    "openai": "^5.16.0"
+  },
+  "devDependencies": {
+    "@types/debug": "^4.1.12",
+    "@types/node": "^20.4.5",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.9.2"
+  }
+}
