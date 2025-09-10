@@ -17,7 +17,8 @@
     "prepare": "npm run build"
   },
   "dependencies": {
-    "askexperts": "^0.7.94",
+    "@noble/hashes": "^1.8.0",
+    "askexperts": "^0.7.116",
     "commander": "^11.0.0",
     "debug": "^4.4.1",
     "nostr-tools": "^2.16.2",

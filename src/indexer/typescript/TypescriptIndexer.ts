@@ -66,7 +66,7 @@ export class TypescriptIndexer {
 
     const quote = await this.client.getQuote(this.expertPubkey, {
       model: this.expertPubkey,
-      temperature: 0,
+      temperature: 0.1,
       messages: [
         {
           role: "system",

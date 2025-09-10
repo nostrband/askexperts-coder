@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
-import { registerPackageCommand } from './package.js';
+import { registerGenerateCommand } from './generate.js';
 import { initializeDebug, debugCli } from '../utils/debug.js';
 import { registerSymbolsCommand } from './symbols.js';
+import { registerRagCommand, registerSearchCommand } from './rag.js';
+import { registerExpertCommand } from './expert.js';
+import { registerPrepareCommand } from './import.js';
 
 // Initialize debug
 initializeDebug();
@@ -18,8 +21,12 @@ program
   .version('1.0.0');
 
 // Register commands
-registerPackageCommand(program);
+registerGenerateCommand(program);
 registerSymbolsCommand(program);
+registerRagCommand(program);
+registerSearchCommand(program);
+registerExpertCommand(program);
+registerPrepareCommand(program);
 
 // Parse command line arguments and execute
 debugCli('Parsing command line arguments');

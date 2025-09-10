@@ -1,26 +1,20 @@
-// list-all-symbols.ts
-import fs from "node:fs";
 import { Command } from "commander";
 import { debugError } from "askexperts/common";
-import { debugCli } from "../utils/debug.js";
+import { enableDebugAll } from "../utils/debug.js";
 import { Symbol, TypeScript } from "../indexer/typescript/TypeScript.js";
 
 export function listAllSymbols(projectPath: string) {
   const parser = new TypeScript(projectPath);
   const symbols = parser.listAllSymbols();
-  console.log("symbols", symbols.length);
-
-  const fillBranch = (s: Symbol, branch?: Symbol[]) => {
-    if (!branch) branch = [];
-    if (!s.parent) return branch;
-    branch.push({ ...s.parent, children: undefined, parent: undefined });
-    return fillBranch(s.parent, branch);
-  };
-
   const rows: any[] = [];
   const print = (s: Symbol) => {
-    const branch = fillBranch(s);
-    rows.push({ ...s, children: undefined, parent: undefined, branch });
+    rows.push({
+      ...s,
+      children: undefined,
+      parent: undefined,
+      // branch,
+      parentId: s.parent?.id,
+    });
   };
 
   const printSymbols = (ss: Symbol[]) => {
@@ -31,7 +25,6 @@ export function listAllSymbols(projectPath: string) {
   };
 
   printSymbols(symbols);
-  console.log("rows", rows.length)
 
   // Output as a single JSON array with nested structure
   console.log(JSON.stringify(rows, null, 2));
@@ -45,7 +38,7 @@ async function processSymbols(
 ): Promise<void> {
   // Enable debug output if debug flag is set
   if (options.debug) {
-    debugCli("Debug mode enabled");
+    enableDebugAll();
   }
 
   try {
