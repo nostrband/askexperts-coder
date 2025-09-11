@@ -6,28 +6,42 @@ import { Symbol, TypeScript } from "../indexer/typescript/TypeScript.js";
 export function listAllSymbols(projectPath: string) {
   const parser = new TypeScript(projectPath);
   const symbols = parser.listAllSymbols();
-  const rows: any[] = [];
-  const print = (s: Symbol) => {
-    rows.push({
-      ...s,
-      children: undefined,
-      parent: undefined,
-      // branch,
-      parentId: s.parent?.id,
-    });
-  };
-
-  const printSymbols = (ss: Symbol[]) => {
-    for (const s of ss) {
-      print(s);
-      if (s.children) printSymbols(s.children);
+  const print = (s: Symbol, offset: number = 0) => {
+    const related = parser.related(s.self);
+    console.log(
+      `${" ".repeat(offset)}${s.id.file}:${s.id.name}:${
+        s.id.kind
+      } rel: ${related
+        .map((r) => parser.buildStableId(r.symbol)?.name)
+        .join(",")}`
+    );
+    for (const c of s.children || []) {
+      print(c, offset + 2);
     }
   };
+  for (const c of symbols) print(c);
+  // const rows: any[] = [];
+  // const print = (s: Symbol) => {
+  //   rows.push({
+  //     ...s,
+  //     children: undefined,
+  //     parent: undefined,
+  //     // branch,
+  //     parentId: s.parent?.id,
+  //   });
+  // };
 
-  printSymbols(symbols);
+  // const printSymbols = (ss: Symbol[]) => {
+  //   for (const s of ss) {
+  //     print(s);
+  //     if (s.children) printSymbols(s.children);
+  //   }
+  // };
 
-  // Output as a single JSON array with nested structure
-  console.log(JSON.stringify(rows, null, 2));
+  // printSymbols(symbols);
+
+  // // Output as a single JSON array with nested structure
+  // console.log(JSON.stringify(rows, null, 2));
 }
 
 // --- helpers ---

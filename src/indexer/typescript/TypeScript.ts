@@ -44,7 +44,7 @@ export type StableSymbolId = {
 export type Symbol = {
   id: StableSymbolId;
   // name: string;
-  kind: string;
+  // kind: string;
   // file: string;
   start: string;
   end: string;
@@ -54,6 +54,7 @@ export type Symbol = {
   declText: string; // the declaration text
   bodyText?: string; // function/method body, when present
   children?: Symbol[]; // child nodes in the symbol hierarchy
+  self: ts.Symbol;
   parent?: Symbol;
   paths?: AccessPath[];
 };
@@ -84,6 +85,35 @@ export class TypeScript {
   private options: ts.CompilerOptions;
   private allRoots: FoundExport[];
   private valueRoots: FoundExport[];
+
+  // Class field you can flip at runtime
+  private debug = true;
+
+  private dbg(...args: any[]) {
+    if (this.debug) console.log("[TSX]", ...args);
+  }
+
+  private symInfo(s?: ts.Symbol) {
+    if (!s) return "<no symbol>";
+    const d = s.getDeclarations()?.[0];
+    const file = d?.getSourceFile().fileName ?? "<nofile>";
+    const name = s.getName();
+    const kind = d ? ts.SyntaxKind[d.kind] : "<nokind>";
+    return `${name} @ ${path.basename(file)} [${kind}]`;
+  }
+
+  private nodeInfo(n: ts.Node) {
+    const sf = n.getSourceFile();
+    const { line, character } = ts.getLineAndCharacterOfPosition(
+      sf,
+      n.getStart(sf, true)
+    );
+    return `${ts.SyntaxKind[n.kind]} "${n
+      .getText()
+      .slice(0, 80)}" @ ${path.basename(sf.fileName)}:${line + 1}:${
+      character + 1
+    }`;
+  }
 
   constructor(projectDir: string, tsconfigName = "tsconfig.json") {
     this.projectDir = path.resolve(projectDir);
@@ -243,7 +273,7 @@ export class TypeScript {
         requiresNew?: boolean;
       }[] = [];
 
-      if (this.isClassLike(expResolved)) {
+      if (isClassLike(expResolved)) {
         const instanceType = this.checker.getDeclaredTypeOfSymbol(expResolved);
         const staticType = this.checker.getTypeOfSymbolAtLocation(
           expResolved,
@@ -310,7 +340,7 @@ export class TypeScript {
 
           // Direct-hit on a non-callable property symbol
           if (this.sameSymbol(resolvedP, targetResolved)) {
-            const stepKind = this.isStaticMember(p) ? "static" : "instance";
+            const stepKind = isStaticMember(p) ? "static" : "instance";
             const steps = [
               ...node.steps,
               { kind: stepKind as "static" | "instance", member: pName },
@@ -322,7 +352,7 @@ export class TypeScript {
           // Enqueue property type for deeper traversal
           if (pType) {
             const step: AccessStep = {
-              kind: this.isStaticMember(p) ? "static" : "instance",
+              kind: isStaticMember(p) ? "static" : "instance",
               member: pName,
             };
             queue.push({
@@ -609,12 +639,36 @@ export class TypeScript {
   }
 
   private inThisPackage(sym: ts.Symbol): boolean {
-    const d = sym.getDeclarations()?.[0];
+    let s = sym;
+
+    // If it's an alias with no decls, try resolving it
+    if (
+      (!s.getDeclarations() || s.getDeclarations()!.length === 0) &&
+      s.getFlags() & ts.SymbolFlags.Alias
+    ) {
+      try {
+        s = this.checker.getAliasedSymbol(s);
+      } catch {
+        // ignore
+      }
+    }
+
+    const d = s.getDeclarations()?.[0];
     if (!d) return false;
-    const f = ts.getOriginalNode(d).getSourceFile();
-    // Exclude libraries and external .d.ts
-    if (f.isDeclarationFile) return f.fileName.startsWith(this.projectDir);
-    return path.resolve(f.fileName).startsWith(this.projectDir);
+
+    const sf = d.getSourceFile();
+    const abs = path.resolve(sf.fileName);
+
+    // Hard exclude external deps even if they live under projectDir
+    if (abs.includes(`${path.sep}node_modules${path.sep}`)) return false;
+
+    // Allow files inside the repo (both .ts and your own .d.ts)
+    if (!sf.isDeclarationFile) {
+      return abs.startsWith(this.projectDir);
+    }
+
+    // Declaration files: permit only if inside the repo and not node_modules
+    return abs.startsWith(this.projectDir);
   }
 
   private isPublicClassElement(m: ts.ClassElement): boolean {
@@ -867,8 +921,9 @@ export class TypeScript {
       if (!id) throw new Error("Failed to build stable id");
       const symbol: Symbol = {
         id,
+        self: sym,
         // name: sym.getName(),
-        kind: ts.SyntaxKind[decl.kind],
+        // kind: ts.SyntaxKind[decl.kind],
         // file: path.relative(this.projectDir, sf.fileName),
         start: `${line + 1}:${character + 1}`,
         end: `${lineEnd + 1}:${characterEnd + 1}`,
@@ -942,7 +997,7 @@ export class TypeScript {
     // Walk every source file and collect declarations with names
     for (const sf of this.program.getSourceFiles()) {
       // Skip lib*.d.ts etc. — remove this filter if you want everything
-      if (sf.isDeclarationFile && !sf.fileName.endsWith(".d.ts")) continue;
+      if (sf.isDeclarationFile) continue;
 
       // Skip files outside the tsconfig directory
       const relativePath = path.relative(this.projectDir, sf.fileName);
@@ -955,37 +1010,89 @@ export class TypeScript {
         } else if (ts.isClassDeclaration(node) && node.name) {
           addRow(node.name, node, parent);
           node.members.forEach((member) => {
-            if (ts.isMethodDeclaration(member) && ts.isIdentifier(member.name))
-              addRow(member.name, member, node);
-            else if (
-              ts.isPropertyDeclaration(member) &&
-              ts.isIdentifier(member.name)
-            )
-              addRow(member.name, member, node);
-            else if (
-              ts.isGetAccessorDeclaration(member) &&
-              ts.isIdentifier(member.name)
-            )
-              addRow(member.name, member, node);
-            else if (
-              ts.isSetAccessorDeclaration(member) &&
-              ts.isIdentifier(member.name)
-            )
-              addRow(member.name, member, node);
+            // constructor (no name node)
+            if (ts.isConstructorDeclaration(member)) {
+              // pass the member itself as the "name node" so addRow uses decl.symbol
+              addRow(member as unknown as ts.Node, member, node);
+              return;
+            }
+
+            // methods
+            if (ts.isMethodDeclaration(member)) {
+              // name can be Identifier | StringLiteral | NumericLiteral | ComputedPropertyName
+              const nameNode = (member.name ?? member) as ts.Node;
+              addRow(nameNode, member, node);
+              return;
+            }
+
+            // properties (incl. static)
+            if (ts.isPropertyDeclaration(member)) {
+              const nameNode = (member.name ?? member) as ts.Node;
+              addRow(nameNode, member, node);
+              return;
+            }
+
+            // accessors
+            if (
+              ts.isGetAccessorDeclaration(member) ||
+              ts.isSetAccessorDeclaration(member)
+            ) {
+              const nameNode = (member.name ?? member) as ts.Node;
+              addRow(nameNode, member, node);
+              return;
+            }
+
+            // index signature (classes can have them)
+            if (ts.isIndexSignatureDeclaration(member)) {
+              addRow(member as unknown as ts.Node, member as any, node);
+              return;
+            }
+
+            // (optional) skip constructors; they have no name node
+            // if (ts.isConstructorDeclaration(member)) { /* usually skip */ }
           });
         } else if (ts.isInterfaceDeclaration(node)) {
           addRow(node.name, node, parent);
           node.members.forEach((member) => {
-            if (ts.isMethodSignature(member) && ts.isIdentifier(member.name))
-              addRow(member.name, member, node);
-            else if (
-              ts.isPropertySignature(member) &&
-              ts.isIdentifier(member.name)
-            )
-              addRow(member.name, member, node);
+            if (ts.isMethodSignature(member)) {
+              // Use the name node if present, otherwise the member itself
+              addRow(member.name ?? member, member, node);
+            } else if (ts.isPropertySignature(member)) {
+              // Accept Identifier | StringLiteral | NumericLiteral | ComputedPropertyName
+              const nameNode = member.name ?? member;
+              addRow(nameNode, member, node);
+            } else if (ts.isIndexSignatureDeclaration(member)) {
+              // Optional: include index signatures as well
+              addRow(member, member as any, node);
+            }
           });
         } else if (ts.isTypeAliasDeclaration(node)) {
           addRow(node.name, node, parent);
+          // If it's a type literal, also list its members
+          if (ts.isTypeLiteralNode(node.type)) {
+            for (const m of node.type.members) {
+              if (ts.isPropertySignature(m)) {
+                // name can be Identifier | StringLiteral | NumericLiteral | ComputedPropertyName
+                const nameNode = (m.name ??
+                  (m as unknown as ts.Node)) as ts.Node;
+                addRow(nameNode, m, node);
+              } else if (ts.isMethodSignature(m)) {
+                const nameNode = (m.name ??
+                  (m as unknown as ts.Node)) as ts.Node;
+                addRow(nameNode, m, node);
+              } else if (ts.isIndexSignatureDeclaration(m)) {
+                // No name node; pass the member itself so addRow falls back to decl.symbol
+                addRow(m as unknown as ts.Node, m as any, node);
+              }
+              // (Optional) handle call/construct signatures if you want them listed:
+              else if (
+                ts.isCallSignatureDeclaration(m) ||
+                ts.isConstructSignatureDeclaration(m)
+              ) {
+                addRow(m as unknown as ts.Node, m as any, node);
+              }
+            }
+          }
         } else if (ts.isEnumDeclaration(node)) {
           addRow(node.name, node, parent);
           node.members.forEach((member) => {
@@ -1135,20 +1242,29 @@ export class TypeScript {
 
     const addSet = new Map<ts.Declaration, RelatedItem>();
     const add = (s: ts.Symbol) => {
-      if (!s) return;
+      if (!s) {
+        this.dbg("add: skip <null>");
+        return;
+      }
 
-      // skip generic type parameters like `T`, `K`, etc.
-      if ((s.getFlags() & ts.SymbolFlags.TypeParameter) !== 0) return;
+      // skip type params
+      if ((s.getFlags() & ts.SymbolFlags.TypeParameter) !== 0) {
+        this.dbg("add: skip type-param", this.symInfo(s));
+        return;
+      }
 
-      // 👇 Keep alias *names* intact (don’t resolve type aliases)
       const isTypeAlias = (s.getFlags() & ts.SymbolFlags.TypeAlias) !== 0;
       const rs = isTypeAlias ? s : this.resolveAlias(s);
 
-      if (!this.inThisPackage(rs)) return;
-      if (this.isAnonymousTypeSym(rs)) return;
+      if (!this.inThisPackage(rs)) {
+        this.dbg("add: skip not-in-package", this.symInfo(rs));
+        return;
+      }
+      if (this.isAnonymousTypeSym(rs)) {
+        this.dbg("add: skip anonymous", this.symInfo(rs));
+        return;
+      }
 
-      // Don’t filter out by "primitive/global" using the *underlying* anonymous/type;
-      // keep alias names even if they alias a primitive/anonymous intersection in part.
       if (!isTypeAlias) {
         const t =
           (this.checker as any).getDeclaredTypeOfSymbol?.(rs) ??
@@ -1156,12 +1272,83 @@ export class TypeScript {
             rs,
             rs.valueDeclaration ?? rs.declarations?.[0] ?? decl
           );
-        if (this.isGlobalOrPrimitive(t, rs)) return;
+        if (this.isGlobalOrPrimitive(t, rs)) {
+          this.dbg("add: skip global/primitive", this.symInfo(rs));
+          return;
+        }
       }
 
       const d = rs.getDeclarations()?.[0];
-      if (!d || d === decl) return;
-      if (!addSet.has(d)) addSet.set(d, { symbol: rs, ...this.locOfDecl(d) });
+      if (!d) {
+        this.dbg("add: skip no decl", this.symInfo(rs));
+        return;
+      }
+      if (d === decl) {
+        this.dbg("add: skip (same decl as target)", this.symInfo(rs));
+        return;
+      }
+      if (addSet.has(d)) {
+        this.dbg("add: dup", this.symInfo(rs));
+        return;
+      }
+
+      this.dbg("add: KEEP", this.symInfo(rs));
+      addSet.set(d, { symbol: rs, ...this.locOfDecl(d) });
+    };
+
+    const isTopLevel = (d: ts.Declaration) => {
+      let p: ts.Node | undefined = d.parent;
+      while (p && !ts.isSourceFile(p)) {
+        if (ts.isFunctionLike(p)) return false;
+        p = p.parent;
+      }
+      return true;
+    };
+
+    // NEW: lenient add for VALUE-side references (property/call/new chains)
+    // - no alias resolution
+    // - no primitive/global filtering
+    // - no "anonymous type" filtering (we only need a real declaration)
+    const addValueRef = (s: ts.Symbol | undefined) => {
+      if (!s) {
+        this.dbg("addValueRef: skip <null>");
+        return;
+      }
+
+      // skip generic params
+      if ((s.getFlags() & ts.SymbolFlags.TypeParameter) !== 0) {
+        this.dbg("addValueRef: skip type-param", this.symInfo(s));
+        return;
+      }
+
+      // we keep the symbol as-is (don’t resolve aliases here)
+      const d = s.getDeclarations()?.[0];
+      if (!d) {
+        this.dbg("addValueRef: skip no decl", this.symInfo(s));
+        return;
+      }
+      if (d === decl) {
+        this.dbg("addValueRef: skip (same decl as target)", this.symInfo(s));
+        return;
+      }
+
+      if (!isTopLevel(d)) {
+        this.dbg("addValueRef: skip non-top-level", this.symInfo(s));
+        return;
+      }
+
+      // must be from this package
+      if (!this.inThisPackage(s)) {
+        this.dbg("addValueRef: skip not-in-package", this.symInfo(s));
+        return;
+      }
+
+      if (addSet.has(d)) {
+        this.dbg("addValueRef: dup", this.symInfo(s));
+        return;
+      }
+      this.dbg("addValueRef: KEEP", this.symInfo(s));
+      addSet.set(d, { symbol: s, ...this.locOfDecl(d) });
     };
 
     // Add predicate target from a declaration node if it has a type predicate (`x is Y`)
@@ -1312,6 +1499,18 @@ export class TypeScript {
 
     // 5) VARIABLE declarations (includes arrow functions / new expressions)
     if (ts.isVariableDeclaration(decl)) {
+      // VALUE-SIDE: collect symbols from initializer chains (b, c, d, e in b.c().d.e())
+      if (decl.initializer) {
+        this.dbg("VAR init:", this.nodeInfo(decl.initializer));
+        for (const s of this.symbolsFromValueExprDeep(decl.initializer)) {
+          this.dbg("VAR init -> add:", this.symInfo(s));
+          addValueRef(s);
+        }
+      } else {
+        this.dbg("VAR no initializer");
+      }
+
+      // TYPE-SIDE (existing logic)
       if (decl.type) {
         this.symbolsFromTypeNodeDeep(decl.type).forEach(add);
       } else {
@@ -1329,8 +1528,9 @@ export class TypeScript {
               (p) => p.type && this.symbolsFromTypeNodeDeep(p.type).forEach(add)
             );
             this.typeTargets(sig.getReturnType()).forEach(add);
+            // No longer needed with symbolsFromValueExprDeep above.
             // arrow/function expressions can also have predicates; check node just in case
-            addPredicateTypeFromNode(init as any);
+            // addPredicateTypeFromNode(init as any);
           }
         } else {
           const vt = this.checker.getTypeOfSymbolAtLocation(sym, decl);
@@ -1383,36 +1583,6 @@ export class TypeScript {
       if (s) return s;
     }
     return (decl as any).symbol as ts.Symbol | undefined;
-  }
-
-  public isClassLike(sym: ts.Symbol): boolean {
-    const d = sym.valueDeclaration ?? sym.declarations?.[0];
-    return !!d && (ts.isClassDeclaration(d) || ts.isClassExpression(d));
-  }
-
-  public isFunctionLike(sym: ts.Symbol): boolean {
-    const decl = sym.valueDeclaration ?? sym.declarations?.[0];
-    return (
-      !!decl &&
-      (ts.isFunctionDeclaration(decl) ||
-        ts.isMethodDeclaration(decl) ||
-        ts.isFunctionExpression(decl) ||
-        ts.isMethodSignature(decl) ||
-        ts.isArrowFunction(decl as any))
-    );
-  }
-
-  private isStaticMember(sym: ts.Symbol): boolean {
-    for (const d of sym.getDeclarations() ?? []) {
-      if (ts.isPropertyDeclaration(d) || ts.isMethodDeclaration(d)) {
-        return !!(ts.getCombinedModifierFlags(d) & ts.ModifierFlags.Static);
-      }
-      // JS assignment like `Chat.Completions = Completions` compiles to a
-      // property assignment on the constructor function; it shows up as a property symbol
-      // on the class's static side, so treat it as static.
-    }
-    // If no declaration info, fall back to assuming instance
-    return false;
   }
 
   private typeKey(t: ts.Type, requiresNew?: boolean): string {
@@ -1544,6 +1714,183 @@ export class TypeScript {
     return false;
   }
 
+  /** Collect symbols referenced by a *value* expression chain (b.c().d.e(), i.generateSecretKey, new Foo()…).
+   * Returns unique symbols by declaration identity, in first-seen order. */
+  private symbolsFromValueExprDeep(expr: ts.Expression): ts.Symbol[] {
+    const out: ts.Symbol[] = [];
+    const seen = new Set<ts.Declaration>();
+    const push = (label: string, s?: ts.Symbol) => {
+      if (!s) {
+        this.dbg("push:", label, "<no symbol>");
+        return;
+      }
+      if ((s.getFlags() & ts.SymbolFlags.TypeParameter) !== 0) {
+        this.dbg("push:", label, "skip type-param", this.symInfo(s));
+        return;
+      }
+      const d = s.getDeclarations()?.[0];
+      if (!d) {
+        this.dbg("push:", label, "skip no decl", this.symInfo(s));
+        return;
+      }
+      if (seen.has(d)) {
+        this.dbg("push:", label, "dup", this.symInfo(s));
+        return;
+      }
+      seen.add(d);
+      this.dbg("push:", label, this.symInfo(s));
+      out.push(s);
+    };
+
+    const visit = (e: ts.Expression) => {
+      this.dbg("visit:", this.nodeInfo(e));
+
+      // unwrap
+      if (
+        ts.isParenthesizedExpression(e) ||
+        ts.isAsExpression(e) ||
+        (ts as any).isTypeAssertionExpression?.(e) ||
+        (ts as any).isNonNullExpression?.(e)
+      ) {
+        visit((e as any).expression);
+        return;
+      }
+      if (ts.isAwaitExpression(e)) {
+        visit(e.expression);
+        return;
+      }
+
+      if (ts.isIdentifier(e)) {
+        push("identifier", this.checker.getSymbolAtLocation(e));
+        return;
+      }
+      if (
+        e.kind === ts.SyntaxKind.ThisKeyword ||
+        e.kind === ts.SyntaxKind.SuperKeyword
+      )
+        return;
+
+      if (ts.isPropertyAccessExpression(e)) {
+        // base
+        visit(e.expression);
+
+        // Try whole expr first
+        let propSym = this.checker.getSymbolAtLocation(e);
+        this.dbg("  PAE whole:", this.symInfo(propSym));
+
+        if (!propSym) {
+          // name-only
+          propSym = this.checker.getSymbolAtLocation(e.name);
+          this.dbg("  PAE name :", this.symInfo(propSym));
+        }
+
+        if (!propSym) {
+          // type fallback
+          const objType = this.checker.getTypeAtLocation(e.expression);
+          const byType = this.checker.getPropertyOfType(objType, e.name.text);
+          this.dbg("  PAE type :", this.symInfo(byType));
+          propSym = byType;
+        }
+
+        push("prop", propSym);
+        return;
+      }
+
+      if (ts.isElementAccessExpression(e)) {
+        visit(e.expression);
+        const objType = this.checker.getTypeAtLocation(e.expression);
+        const key = e.argumentExpression;
+
+        if (key && ts.isStringLiteral(key)) {
+          const p = this.checker.getPropertyOfType(objType, key.text);
+          this.dbg("  EAE str :", key.text, this.symInfo(p));
+          push("elem[str]", p);
+        } else if (key && ts.isIdentifier(key)) {
+          const keySym = this.checker.getSymbolAtLocation(key);
+          const kd = keySym?.valueDeclaration ?? keySym?.declarations?.[0];
+          const init =
+            kd && ts.isVariableDeclaration(kd) ? kd.initializer : undefined;
+          if (init && ts.isStringLiteral(init)) {
+            const p = this.checker.getPropertyOfType(objType, init.text);
+            this.dbg("  EAE id->str :", init.text, this.symInfo(p));
+            push("elem[id->str]", p);
+          } else {
+            this.dbg("  EAE id unresolved:", key.getText());
+          }
+        }
+        return;
+      }
+
+      if (ts.isCallExpression(e)) {
+        const sig = this.checker.getResolvedSignature(e);
+        const decl = sig?.declaration;
+        let calleeSym: ts.Symbol | undefined =
+          (decl && (decl as any).symbol) || undefined;
+        this.dbg(
+          "  CALL sig.decl:",
+          decl ? ts.SyntaxKind[decl.kind] : "<none>",
+          "sym:",
+          this.symInfo(calleeSym)
+        );
+
+        if (!calleeSym) {
+          const callee = e.expression;
+          calleeSym =
+            this.checker.getSymbolAtLocation(callee) ||
+            (ts.isPropertyAccessExpression(callee)
+              ? this.checker.getSymbolAtLocation(callee.name)
+              : undefined);
+          this.dbg("  CALL expr sym:", this.symInfo(calleeSym));
+        }
+
+        push("call", calleeSym);
+        visit(e.expression);
+        // e.arguments?.forEach(visit);
+        return;
+      }
+
+      if (ts.isNewExpression(e)) {
+        const sig = this.checker.getResolvedSignature(e);
+        let cls: ts.Symbol | undefined =
+          (sig?.declaration && (sig.declaration as any).symbol) ||
+          this.checker.getSymbolAtLocation(e.expression);
+        this.dbg("  NEW cls:", this.symInfo(cls));
+        push("new", cls);
+        if (ts.isExpression(e.expression)) visit(e.expression);
+        return;
+      }
+
+      if (ts.isConditionalExpression(e)) {
+        visit(e.whenTrue);
+        visit(e.whenFalse);
+        return;
+      }
+      if (ts.isBinaryExpression(e)) {
+        const op = e.operatorToken.kind;
+        if (
+          op === ts.SyntaxKind.BarBarToken ||
+          op === ts.SyntaxKind.QuestionQuestionToken ||
+          op === ts.SyntaxKind.AmpersandAmpersandToken
+        ) {
+          visit(e.left);
+          visit(e.right);
+          return;
+        }
+      }
+
+      ts.forEachChild(e, (c) => {
+        if (ts.isExpression(c)) visit(c);
+      });
+    };
+
+    visit(expr);
+    this.dbg(
+      "value-walk result:",
+      out.map((s) => this.symInfo(s))
+    );
+    return out;
+  }
+
   getProgram(): ts.Program {
     return this.program;
   }
@@ -1645,70 +1992,42 @@ export function getDeclarationHeader(
   // 7) Fallback: declarations without bodies (overloads, ambient) are fine as-is
   return decl.getText(sf);
 }
-
+/** True if `node` is declared at file/public-surface scope (not a local). */
 function isFileScopeDeclaration(
   node: ts.Node,
   opts?: { allowNamespaces?: boolean }
 ): boolean {
   let cur: ts.Node | undefined = node.parent;
 
-  while (cur && !ts.isSourceFile(cur)) {
-    // Namespace/module blocks are *not* file scope (set allowNamespaces to true if you want them)
-    if (ts.isModuleBlock(cur)) {
-      return !!opts?.allowNamespaces; // false by default
-    }
+  while (cur) {
+    // Reached a file container → file scope
+    if (ts.isSourceFile(cur)) return true;
 
-    // Inside any function-like -> local
-    if (
-      ts.isFunctionDeclaration(cur) ||
-      ts.isMethodDeclaration(cur) ||
-      ts.isFunctionExpression(cur) ||
-      ts.isArrowFunction(cur) ||
-      ts.isConstructorDeclaration(cur) ||
-      ts.isGetAccessorDeclaration(cur) ||
-      ts.isSetAccessorDeclaration(cur)
-    ) {
-      return false;
-    }
+    // Namespace/module blocks: treat as file scope if allowed
+    if (ts.isModuleBlock(cur)) return !!opts?.allowNamespaces;
 
-    // Inside class/enum/object literal member -> local/internal
-    if (
-      ts.isClassDeclaration(cur) ||
-      ts.isClassExpression(cur) ||
-      ts.isEnumDeclaration(cur) ||
-      ts.isObjectLiteralExpression(cur)
-    ) {
-      return false;
-    }
+    // Public-surface containers → their members are not locals
+    if (ts.isClassDeclaration(cur) || ts.isClassExpression(cur)) return true;
+    if (ts.isInterfaceDeclaration(cur)) return true;
+    if (ts.isTypeLiteralNode(cur)) return true; // <--- NEW
+    if (ts.isEnumDeclaration(cur)) return true;
 
-    // Inside block/statement scopes -> local
-    if (
-      ts.isBlock(cur) ||
-      ts.isIfStatement(cur) ||
-      ts.isSwitchStatement(cur) ||
-      ts.isCaseClause(cur) ||
-      ts.isDefaultClause(cur) ||
-      ts.isTryStatement(cur) ||
-      ts.isCatchClause(cur) ||
-      ts.isWithStatement(cur) ||
-      ts.isLabeledStatement(cur) ||
-      ts.isDoStatement(cur) ||
-      ts.isWhileStatement(cur) ||
-      ts.isForStatement(cur) ||
-      ts.isForInStatement(cur) ||
-      ts.isForOfStatement(cur)
-    ) {
+    // Function-like → locals
+    if (isFunctionLikeNode(cur)) return false;
+    if (ts.isBlock(cur) && cur.parent && isFunctionLikeNode(cur.parent))
       return false;
-    }
+
+    // Top-level statement container (non-decl) → locals
+    if (isTopLevelNonDeclStmt(cur)) return false;
 
     cur = cur.parent;
   }
-
-  // We reached the SourceFile without hitting any enclosing scope → top-level
-  return !!cur && ts.isSourceFile(cur);
+  return false;
 }
 
 function shouldSkipAsLocal(node: ts.Node): boolean {
+  // Never skip type members (interface / type-literal)
+  if (ts.isTypeElement(node)) return false;
   return !isFileScopeDeclaration(node, { allowNamespaces: true });
 }
 
@@ -2002,8 +2321,37 @@ function containerChainOf(
 
 function declName(decl: ts.Declaration, checker: ts.TypeChecker): string {
   const nameNode = (decl as any).name as ts.Node | undefined;
-  if (nameNode && ts.isIdentifier(nameNode)) return nameNode.text;
+
+  // Constructor has no name node
+  if (ts.isConstructorDeclaration(decl)) {
+    return "constructor";
+  }
+
+  if (nameNode) {
+    if (ts.isIdentifier(nameNode)) return nameNode.text;
+    if (ts.isStringLiteral(nameNode) || ts.isNumericLiteral(nameNode)) {
+      return nameNode.text;
+    }
+    if (ts.isComputedPropertyName(nameNode)) {
+      const expr = nameNode.expression;
+      return `[${ts.isIdentifier(expr) ? expr.text : expr.getText()}]`;
+    }
+  }
+
+  // export { a as b } from '...'
+  if (ts.isExportSpecifier(decl)) {
+    // the exported name (rhs of `as`) is what consumers see
+    return (decl.name ?? decl.propertyName)?.getText() ?? "<anonymous>";
+  }
+
   if (ts.isExportAssignment(decl)) return "export=";
+
+  if (ts.isIndexSignatureDeclaration(decl)) {
+    const p = decl.parameters?.[0];
+    if (p && ts.isIdentifier(p.name)) return `[${p.name.text}]`;
+    return "[index]";
+  }
+
   return "<anonymous>";
 }
 
@@ -2210,7 +2558,6 @@ export function resolveStableId(
   const file = program.getSourceFile(path.resolve(projectDir, id.file));
   const candidates: ts.Declaration[] = [];
 
-  const wantHeaderHash = id.headerHash;
   const considerDecl = (decl: ts.Declaration) => {
     if (ts.SyntaxKind[decl.kind] !== id.kind) return;
 
@@ -2669,4 +3016,58 @@ function pruneNamespaceDuplicates(paths: AccessPath[]): AccessPath[] {
       p.root.reexportedFrom ?? p.root.declarationFile ?? p.root.moduleFile;
     return !directSources.has(nsSource);
   });
+}
+
+export function isClassLike(sym: ts.Symbol): boolean {
+  const d = sym.valueDeclaration ?? sym.declarations?.[0];
+  return !!d && (ts.isClassDeclaration(d) || ts.isClassExpression(d));
+}
+
+export function isFunctionLike(sym: ts.Symbol): boolean {
+  const decl = sym.valueDeclaration ?? sym.declarations?.[0];
+  return !!decl && isFunctionLikeNode(decl);
+}
+
+function isFunctionLikeNode(node: ts.Node): boolean {
+  return (
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isConstructorDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node)
+  );
+}
+
+function isTopLevelNonDeclStmt(node: ts.Node): boolean {
+  return (
+    ts.isBlock(node) ||
+    ts.isIfStatement(node) ||
+    ts.isSwitchStatement(node) ||
+    ts.isCaseClause(node) ||
+    ts.isDefaultClause(node) ||
+    ts.isTryStatement(node) ||
+    ts.isCatchClause(node) ||
+    ts.isWithStatement(node) ||
+    ts.isLabeledStatement(node) ||
+    ts.isDoStatement(node) ||
+    ts.isWhileStatement(node) ||
+    ts.isForStatement(node) ||
+    ts.isForInStatement(node) ||
+    ts.isForOfStatement(node)
+  );
+}
+
+export function isStaticMember(sym: ts.Symbol): boolean {
+  for (const d of sym.getDeclarations() ?? []) {
+    if (ts.isPropertyDeclaration(d) || ts.isMethodDeclaration(d)) {
+      return !!(ts.getCombinedModifierFlags(d) & ts.ModifierFlags.Static);
+    }
+    // JS assignment like `Chat.Completions = Completions` compiles to a
+    // property assignment on the constructor function; it shows up as a property symbol
+    // on the class's static side, so treat it as static.
+  }
+  // If no declaration info, fall back to assuming instance
+  return false;
 }

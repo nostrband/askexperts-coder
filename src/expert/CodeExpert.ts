@@ -11,6 +11,8 @@ import {
   createSymbolIdHash,
   equalStableId,
   getDeclarationHeader,
+  isClassLike,
+  isFunctionLike,
   StableSymbolId,
   Symbol,
   TypeScript,
@@ -400,12 +402,12 @@ lines: ${symbolInfo.start.split(":")[0]}:${symbolInfo.end.split(":")[0]}
   // Interface string body
   const header = getDeclarationHeader(decl, decl.getSourceFile());
   const body = decl.getText();
-  const interfaceString = typescript.isClassLike(symbol)
+  const interfaceString = isClassLike(symbol)
     ? typescript.printClassLikePublicInterface(
         decl as ts.ClassDeclaration | ts.ClassExpression,
         {}
       )
-    : typescript.isFunctionLike(symbol)
+    : isFunctionLike(symbol)
     ? header
     : body;
 
