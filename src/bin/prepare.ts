@@ -3,8 +3,8 @@ import path from "node:path";
 import { Command } from "commander";
 import { debugCli, debugError, enableDebugAll } from "../utils/debug.js";
 import { TypeScript } from "../indexer/typescript/TypeScript.js";
-import { DocSymbol, symbolToDoc } from "../expert/CodeExpert.js";
 import { INDEXER_DIR } from "./index.js";
+import { DocSymbol, symbolToDoc } from "../utils/docstore.js";
 
 /**
  * Process JSON files in the INDEXER_DIR directory and convert to docs
