@@ -205,7 +205,9 @@ async function processProject(
     // Get current commit hash
     const currentCommitHash = getCurrentCommitHash(absolutePath);
     
-    const docsPath = path.join(absolutePath, options.dir || INDEXER_DIR);
+    const docsPath = options.dir
+      ? path.resolve(process.cwd(), options.dir)
+      : path.join(absolutePath, INDEXER_DIR);
     fs.mkdirSync(docsPath, { recursive: true });
     
     // Handle commit.git file based on --continue option
