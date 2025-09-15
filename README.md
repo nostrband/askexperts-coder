@@ -36,43 +36,64 @@ Here's the complete process to create an AI expert from your TypeScript codebase
 ### 1. Analyze Symbols
 First, explore your project structure and evaluate the indexer quality:
 ```bash
-npx askexperts-coder symbols ./my-project
+npx askexperts-coder symbols ./my-project -d
 ```
 
 ### 2. Generate Documentation
 Generate AI-powered documentation for all symbols:
 ```bash
-npx askexperts-coder generate ./my-project --nwc "nostr+walletconnect://..."
+npx askexperts-coder generate ./my-project -d --nwc "nostr+walletconnect://..."
 ```
 
 ### 3. Prepare for Import
 Convert the generated docs to docstore format:
 ```bash
-npx askexperts-coder prepare ./my-project --dir ./prepared-docs
+npx askexperts-coder prepare ./my-project --dir ./prepared-docs -d
 ```
 
-### 4. Create Docstore
+### 4. Create 'askexperts' user
+```bash
+npx askexperts user add -d
+```
+
+### 5. Create Docstore
 Create a new docstore to hold your project documentation:
 ```bash
-npx askexperts docstore create my_project_store
+npx askexperts docstore create my_project_store -d
 ```
+Prints `docstore_id` - copy it and use below.
 
-### 5. Import to Docstore
+### 6. Import to Docstore
 Import the prepared documentation into the docstore:
 ```bash
-npx askexperts docstore import dir --docstore=my_project_store --path=./prepared-docs
+npx askexperts docstore import dir ./prepared-docs -s <docstore_id> -d
 ```
 
-### 6. Create Expert
-Create a RAG-enabled expert using the imported documentation:
+### 7. Add wallet
 ```bash
-npx askexperts expert create rag my_project_expert -s my_project_store --model gpt-4 --system_prompt "You are an expert on my TypeScript project. Use the provided documentation to answer questions accurately."
+npx askexperts wallet add main -n <nwc-wallet> -d
 ```
 
-### 7. Launch Expert
-Start the expert service:
+### 8. Create Expert
+Create a RAG-enabled expert using the imported documentation and wallet:
 ```bash
-npx askexperts expert run <expert_pubkey>
+npx askexperts expert create rag my_project_expert -d -s <docstore_id> --model gpt-4 --system_prompt "You are an expert on my TypeScript project. Use the provided documentation to answer questions accurately."
+```
+Prints `expert pubkey` - copy it and use below.
+
+### 9. Launch RAG db
+```bash
+docker run -p 8000:8000 -v ./data:/data chromadb/chroma
+```
+
+### 9. Launch Expert
+```bash
+npx askexperts expert run <expert_pubkey> -d
+```
+
+### 10. Chat with Expert
+```bash
+npx askexperts expert chat <expert_pubkey> 
 ```
 
 ## Commands

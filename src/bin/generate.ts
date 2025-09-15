@@ -165,7 +165,7 @@ function validateCommitForContinue(docsPath: string, currentCommitHash: string):
  */
 async function processProject(
   projectPath: string,
-  options: { debug?: boolean; nwc?: string, name?: string, continue?: boolean, threads?: number, branch?: string, dir?: string }
+  options: { debug?: boolean; nwc?: string, name?: string, continue?: boolean, threads?: number, branch?: string, dir?: string, maxAmount?: number }
 ): Promise<void> {
   // Enable debug output if debug flag is set
   if (options.debug) {
@@ -251,6 +251,7 @@ async function processProject(
 
     const indexer = new TypescriptIndexer({
       nwc: nwcString,
+      maxAmount: options.maxAmount,
       systemPrompt: `
 You are a TypeScript expert, your task is to create documentation for every symbol in a typescript project.
 
@@ -260,14 +261,14 @@ User will provide:
 3. Description of the symbol with name, declaration and start/end line:column numbers.
 
 You job is:
-1. Create a short documentation of the public "side" of the symbol - what it does, what params accepts, what is returned, 
+1. Create a short documentation of the public "side" of the symbol - what it does, what params accepts, what is returned,
 what public side effects happen, etc.
-2. Create a short documentation of the implementation details of the symbol - what it does, how it works, what main 
+2. Create a short documentation of the implementation details of the symbol - what it does, how it works, what main
 components/modules/functions are used, anything that would help a coder get a rough vision of the implementation without
 reading the full source code. If the symbol is trivial, leave this doc entry empty.
-3. Return a document in this JSON format (no markdown!): "{ summary: <public_docs>, details: <implementation_docs> }" 
-4. Make sure you return valid json with escaped line-breaks in "details" field, especially important when your 
-details contain numbered lists. 
+3. Return a document in this JSON format (no markdown!): "{ summary: <public_docs>, details: <implementation_docs> }"
+4. Make sure you return valid json with escaped line-breaks in "details" field, especially important when your
+details contain numbered lists.
 
 If the provided input is invalid, return "ERROR: <reason>" string.
 `
@@ -294,7 +295,7 @@ If the provided input is invalid, return "ERROR: <reason>" string.
         fileContent: string;
         existingDocSymbols: Map<string, any>;
       },
-      options: { debug?: boolean; nwc?: string; name?: string; continue?: boolean; threads?: number; branch?: string; dir?: string }
+      options: { debug?: boolean; nwc?: string; name?: string; continue?: boolean; threads?: number; branch?: string; dir?: string; maxAmount?: number }
     ): Promise<void> {
       // Check if we need to load a new file
       if (symbol.id.file !== fileCache.currentFile) {
@@ -450,5 +451,6 @@ export function registerGenerateCommand(program: Command): void {
     .option("-t, --threads <number>", "Number of parallel processing threads", (value) => parseInt(value, 10), 1)
     .option("-b, --branch <string>", "Expected git branch (default: main)", "main")
     .option("--dir <string>", `Output directory for generated docs (default: ${INDEXER_DIR})`)
+    .option("--max-amount <sats>", "Maximum amount in sats to spend per symbol (default: 100)", (value) => parseInt(value, 10), 100)
     .action(processProject);
 }
