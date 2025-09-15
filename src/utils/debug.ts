@@ -1,12 +1,12 @@
 import debug from 'debug';
 
 // Namespace for our application
-const BASE_NAMESPACE = 'askexperts-hacker';
+const BASE_NAMESPACE = 'askexperts-coder';
 const ASKEXPERTS_PREFIX = 'askexperts';
 
 // Debug functions for different modules
 export const debugCli = debug(`${BASE_NAMESPACE}:cli`);
-export const debugTypescriptHacker = debug(`${BASE_NAMESPACE}:typescript-hacker`);
+export const debugTypescript = debug(`${BASE_NAMESPACE}:typescript`);
 export const debugError = debug(`${BASE_NAMESPACE}:error`);
 
 // Helper for tracking execution path (useful for debugging)

@@ -1,13 +1,13 @@
 {
-  "name": "askexperts-hacker",
-  "version": "1.0.0",
-  "description": "AI agent that analyzes TypeScript source codebases to produce searchable documentation",
+  "name": "askexperts-coder",
+  "version": "1.0.1",
+  "description": "Convert code to RAG for AI experts",
   "license": "MIT",
   "author": "",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "askexperts-hacker": "./dist/bin/index.js"
+    "askexperts-coder": "./dist/bin/index.js"
   },
   "scripts": {
     "build": "tsc",

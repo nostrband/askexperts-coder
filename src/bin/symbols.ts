@@ -7,41 +7,24 @@ export function listAllSymbols(projectPath: string) {
   const parser = new TypeScript(projectPath);
   const symbols = parser.listAllSymbols();
   const print = (s: Symbol, offset: number = 0) => {
-    const related = parser.related(s.self);
+    // For overloaded functions, we need to resolve back to the specific declaration
+    // that was used to create this symbol, not just use s.self
+    const resolved = parser.resolveStableId(s.id);
+    if (!resolved) throw new Error("Failed to resolve "+JSON.stringify(s.id));
+
+    const related = parser.related(resolved.decl);
     console.log(
-      `${" ".repeat(offset)}${s.id.file}:${s.id.name}:${
+      `${" ".repeat(offset)}${s.id.file}:${s.start}:${s.end}:${s.id.name}:${
         s.id.kind
-      } rel: ${related
+      }:${s.id.overloadIndex} rel: ${related
         .map((r) => parser.buildStableId(r.symbol)?.name)
-        .join(",")}`
+        .join(",")}` //  ${JSON.stringify(s.id)}
     );
     for (const c of s.children || []) {
       print(c, offset + 2);
     }
   };
   for (const c of symbols) print(c);
-  // const rows: any[] = [];
-  // const print = (s: Symbol) => {
-  //   rows.push({
-  //     ...s,
-  //     children: undefined,
-  //     parent: undefined,
-  //     // branch,
-  //     parentId: s.parent?.id,
-  //   });
-  // };
-
-  // const printSymbols = (ss: Symbol[]) => {
-  //   for (const s of ss) {
-  //     print(s);
-  //     if (s.children) printSymbols(s.children);
-  //   }
-  // };
-
-  // printSymbols(symbols);
-
-  // // Output as a single JSON array with nested structure
-  // console.log(JSON.stringify(rows, null, 2));
 }
 
 // --- helpers ---

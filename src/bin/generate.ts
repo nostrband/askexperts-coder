@@ -2,9 +2,13 @@ import { Command } from "commander";
 import path from "path";
 import fs from "fs";
 import os from "os";
+import { execSync } from "child_process";
 import { debugCli, debugError, enableDebugAll } from "../utils/debug.js";
 import { StableSymbolId, Symbol, TypeScript } from "../indexer/typescript/TypeScript.js";
 import { TypescriptIndexer } from "../indexer/typescript/TypescriptIndexer.js";
+import { INDEXER_DIR } from "./index.js";
+
+const NWC_FILE = ".askexperts-coder.nwc";
 
 /**
  * Gets the NWC string from the provided option, from the file, or throws an error
@@ -19,8 +23,8 @@ export function getNwcString(optionNwc?: string): string {
     return optionNwc;
   }
 
-  // Try to read from ~/.askexperts-hacker-nwc file
-  const nwcFilePath = path.join(os.homedir(), ".askexperts-hacker-nwc");
+  // Try to read from file
+  const nwcFilePath = path.join(os.homedir(), NWC_FILE);
 
   if (fs.existsSync(nwcFilePath)) {
     try {
@@ -32,23 +36,125 @@ export function getNwcString(optionNwc?: string): string {
 
   // If we get here, no NWC string is available
   throw new Error(
-    "No NWC string available. Please provide a NWC string using the --nwc option or create a ~/.askexperts-hacker-nwc file."
+    `No NWC string available. Please provide a NWC string using the --nwc option or create a ~/${NWC_FILE} file.`
   );
 }
 
 /**
- * Saves the NWC string to the ~/.askexperts-hacker-nwc file
+ * Saves the NWC string to the file
  *
  * @param nwcString - The NWC string to save
  */
 export function saveNwcString(nwcString: string): void {
   try {
-    const nwcFilePath = path.join(os.homedir(), ".askexperts-hacker-nwc");
+    const nwcFilePath = path.join(os.homedir(), NWC_FILE);
     fs.writeFileSync(nwcFilePath, nwcString);
     debugCli(`NWC string saved to ${nwcFilePath}`);
   } catch (error) {
     debugError(`Error saving NWC string to file: ${(error as Error).message}`);
   }
+}
+
+/**
+ * Check git status and ensure we're on the expected branch with a clean tree
+ *
+ * @param projectPath - Path to the project to check
+ * @param expectedBranch - Expected git branch (default: main)
+ */
+function checkGitStatus(projectPath: string, expectedBranch: string = "main"): void {
+  try {
+    debugCli(`Checking git status in ${projectPath}...`);
+    
+    // Check git status
+    const gitStatus = execSync("git status --porcelain", {
+      cwd: projectPath,
+      encoding: "utf8"
+    }).trim();
+    
+    if (gitStatus) {
+      throw new Error(`Git tree is not clean. Please commit or stash your changes first.\nUncommitted changes:\n${gitStatus}`);
+    }
+    
+    // Check current branch
+    const currentBranch = execSync("git rev-parse --abbrev-ref HEAD", {
+      cwd: projectPath,
+      encoding: "utf8"
+    }).trim();
+    
+    if (currentBranch !== expectedBranch) {
+      throw new Error(`Expected to be on branch '${expectedBranch}', but currently on '${currentBranch}'`);
+    }
+    
+    debugCli(`Git status check passed: on branch '${currentBranch}' with clean tree`);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("not a git repository")) {
+      throw new Error(`Project at ${projectPath} is not a git repository`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Get the current git commit hash
+ *
+ * @param projectPath - Path to the project
+ * @returns The current commit hash
+ */
+function getCurrentCommitHash(projectPath: string): string {
+  try {
+    const commitHash = execSync("git rev-parse HEAD", {
+      cwd: projectPath,
+      encoding: "utf8"
+    }).trim();
+    
+    debugCli(`Current commit hash: ${commitHash}`);
+    return commitHash;
+  } catch (error) {
+    throw new Error(`Failed to get git commit hash: ${(error as Error).message}`);
+  }
+}
+
+/**
+ * Write commit hash to INDEXER_DIR/commit.git file
+ *
+ * @param docsPath - Path to the INDEXER_DIR directory
+ * @param commitHash - The commit hash to write
+ */
+function writeCommitFile(docsPath: string, commitHash: string): void {
+  const commitFilePath = path.join(docsPath, "commit.git");
+  fs.writeFileSync(commitFilePath, commitHash);
+  debugCli(`Commit hash written to ${commitFilePath}`);
+}
+
+/**
+ * Check if commit.git file exists and validate commit hash for --continue mode
+ *
+ * @param docsPath - Path to the INDEXER_DIR directory
+ * @param currentCommitHash - The current commit hash
+ * @returns true if validation passes or file doesn't exist
+ */
+function validateCommitForContinue(docsPath: string, currentCommitHash: string): boolean {
+  const commitFilePath = path.join(docsPath, "commit.git");
+  
+  if (!fs.existsSync(commitFilePath)) {
+    debugCli("commit.git file does not exist, proceeding with --continue");
+    writeCommitFile(docsPath, currentCommitHash);
+    return true;
+  }
+  
+  const existingCommitHash = fs.readFileSync(commitFilePath, "utf8").trim();
+  
+  if (existingCommitHash !== currentCommitHash) {
+    throw new Error(
+      `Commit hash mismatch in --continue mode.\n` +
+      `Expected: ${existingCommitHash}\n` +
+      `Current:  ${currentCommitHash}\n` +
+      `Please ensure you're on the same commit as when generation was started.`
+    );
+  }
+  
+  debugCli(`Commit hash validation passed for --continue mode: ${currentCommitHash}`);
+  return true;
 }
 
 /**
@@ -59,7 +165,7 @@ export function saveNwcString(nwcString: string): void {
  */
 async function processProject(
   projectPath: string,
-  options: { debug?: boolean; nwc?: string, name?: string, continue?: boolean, threads?: number }
+  options: { debug?: boolean; nwc?: string, name?: string, continue?: boolean, threads?: number, branch?: string }
 ): Promise<void> {
   // Enable debug output if debug flag is set
   if (options.debug) {
@@ -92,8 +198,22 @@ async function processProject(
 
     debugCli(`Project path: ${absolutePath}`);
 
-    const docsPath = path.join(absolutePath, 'indexer_docs');
+    // Check git status and branch before proceeding
+    const expectedBranch = options.branch || "main";
+    checkGitStatus(absolutePath, expectedBranch);
+    
+    // Get current commit hash
+    const currentCommitHash = getCurrentCommitHash(absolutePath);
+    
+    const docsPath = path.join(absolutePath, INDEXER_DIR);
     fs.mkdirSync(docsPath, { recursive: true });
+    
+    // Handle commit.git file based on --continue option
+    if (options.continue) {
+      validateCommitForContinue(docsPath, currentCommitHash);
+    } else {
+      writeCommitFile(docsPath, currentCommitHash);
+    }
 
     debugCli(`Loading project...`);
 
@@ -101,22 +221,15 @@ async function processProject(
     const symbols = project.listAllSymbols();
     debugCli(`Project has ${symbols.length} root symbols`);
 
-    // const fillBranch = (s: Symbol, branch?: Symbol[]) => {
-    //   if (!branch) branch = [];
-    //   if (!s.parent) return branch;
-    //   branch.push({ ...s.parent, children: undefined, parent: undefined });
-    //   return fillBranch(s.parent, branch);
-    // };
-
     const symbolInfos: (Symbol & { parentId?: StableSymbolId })[] = [];
     const addInfo = (s: Symbol) => {
-      // const branch = fillBranch(s);
       symbolInfos.push({
         ...s,
+        parentId: s.parent?.id,
+
+        // not needed, and can't be stringified
         children: undefined,
         parent: undefined,
-        parentId: s.parent?.id,
-        // branch,
       });
     };
 
@@ -179,7 +292,7 @@ If the provided input is invalid, return "ERROR: <reason>" string.
         fileContent: string;
         existingDocSymbols: Map<string, any>;
       },
-      options: { debug?: boolean; nwc?: string; name?: string; continue?: boolean; threads?: number }
+      options: { debug?: boolean; nwc?: string; name?: string; continue?: boolean; threads?: number; branch?: string }
     ): Promise<void> {
       // Check if we need to load a new file
       if (symbol.id.file !== fileCache.currentFile) {
@@ -326,12 +439,13 @@ If the provided input is invalid, return "ERROR: <reason>" string.
 export function registerGenerateCommand(program: Command): void {
   program
     .command("generate")
-    .description("Generate docs for package symbols in 'indexer_docs' subdir")
+    .description(`Generate docs for package symbols in '${INDEXER_DIR}' subdir`)
     .argument("<path_to_project>", "Path to the project to process")
     .option("-d, --debug", "Enable debug output")
     .option("--nwc <string>", "Lightning Node Connect (NWC) string for payment")
     .option("-n, --name", "Symbol name to find if it is exported")
     .option("-c, --continue", "Continue processing, skipping symbols that are already documented")
     .option("-t, --threads <number>", "Number of parallel processing threads", (value) => parseInt(value, 10), 1)
+    .option("-b, --branch <string>", "Expected git branch (default: main)", "main")
     .action(processProject);
 }

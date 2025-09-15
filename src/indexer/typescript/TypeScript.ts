@@ -1,8 +1,103 @@
+/**
+ * TypeScript Export & Symbol Analysis
+ *
+ * Overview
+ * This module builds a developer-centric view of a package’s “public interface”.
+ * It:
+ * - Collects all exports (named, default, namespace, CommonJS export=), following re-exports.
+ * - Lists all symbols declared at file/public scope, including:
+ *   - classes, interfaces, type aliases, enums, functions, variables, modules
+ *   - class/interface members (methods, fields, accessors, index signatures, constructors)
+ *   - members of inline type literals (type Foo = { ... }) and object literals inside exported consts
+ * - Computes access paths from exported surfaces to a target symbol (how a consumer would use it),
+ *   traversing static/instance members and callable steps (BFS), and marks when construction is required.
+ * - Finds related types used across the public API surface:
+ *   - function/method parameters and return types (including type predicates)
+ *   - class/interface heritage (extends/implements) and members
+ *   - type alias targets and generic arguments
+ *   - variable declared/inferred types and initializer chains (e.g., i.generateSecretKey, a.b().c.d)
+ * - Generates stable symbol IDs that survive formatting and line changes, using:
+ *   project-relative path, kind/name, container chain, normalized header hash, and overload index,
+ *   plus optional export hints to assist future resolution.
+ * - Emits correct import statements for each FoundExport (named, default, namespace, export=),
+ *   trimming /index and respecting project root vs src/rootDir heuristics.
+ * - Ranks paths (rankPaths) so canonical, human-friendly access paths are preferred:
+ *   favors entrypoints/barrels, preferred names (default, OpenAI), class roots for values,
+ *   and penalizes deep folders, private-like steps, and internal hops (e.g. _client).
+ *
+ * Key Implementation Details and Fixes
+ * - Exports:
+ *   - Namespace re-exports (export * as ns from './x') are detected and emitted as namespace roots.
+ *   - isTypeOnly is computed from the resolved symbol’s runtime presence, not from syntax alone.
+ * - Paths (pathsTo):
+ *   - Direct-hit optimization: if an exported symbol is the target, return the root with no steps.
+ *   - Variables that alias functions/properties are recognized via initializerTargetsSymbol:
+ *     handles Identifiers and property/element access (obj.prop / obj["prop"]).
+ *   - BFS traverses static and instance sides for classes; callable members produce only call steps (.foo(...)).
+ *   - Deduplication by root/export and the “pretty” string.
+ * - Related types (related):
+ *   - Deep type-node traversal (symbolsFromTypeNodeDeep) covers utility types (Omit/Pick/Promise),
+ *     unions/intersections, mapped/conditional/indexed types, type queries/import types, etc.
+ *   - Value-side walking (symbolsFromValueExprDeep) collects symbols from initializer chains and new expressions.
+ *   - Filters exclude primitives/globals/stdlib and anonymous/internal shapes; keeps only in-repo symbols.
+ *   - Includes the container type (class/interface) for member declarations.
+ * - listAllSymbols:
+ *   - Skips locals using shouldSkipAsLocal while allowing type/interface/class members.
+ *   - Includes constructors explicitly and members of type-literal aliases.
+ *   - Also enumerates object-literal members inside exported consts.
+ * - Stable IDs:
+ *   - Header-only slicing (getDeclarationHeader) removes bodies to stabilize across formatting changes.
+ *   - Overload index is derived from normalized headers among siblings.
+ *   - Resolution (resolveStableId) uses kind/name/container/headerHash, with project-wide fallback scan.
+ * - Import generation:
+ *   - Correctly distinguishes namespace exports from named imports.
+ *   - Trims .ts/.tsx/.mts/.cts and trailing /index, respects rootDir/src heuristics.
+ *
+ * Usage
+ * - Construct an analyzer for a package directory with a tsconfig:
+ *   const tsx = new TypeScript(projectDir, "tsconfig.json?");
+ * - Query exports/symbols:
+ *   tsx.list() / tsx.find(name) / tsx.listAllSymbols()
+ * - Compute usage paths and rank them:
+ *   tsx.pathsTo(symbolOrDecl) / tsx.pathsToRanked(symbolOrDecl, options)
+ * - Discover related types:
+ *   tsx.related(symbolOrDecl)
+ * - Generate stable IDs and resolve them later:
+ *   tsx.buildStableId(symbolOrDecl) / tsx.resolveStableId(id)
+ * - Generate an import statement for an export:
+ *   tsx.makeImportStatement(foundExport, packageName?)
+ * - Print a class’s public interface:
+ *   tsx.printClassLikePublicInterface(classNode, options)
+ *
+ * Performance/Debugging
+ * - This analyzer walks ASTs and types; it can be heavy on large codebases.
+ * - Toggle debug logging via the instance field `debug`.
+ *
+ * This file is intentionally verbose with helper routines for clarity and resilience across TS versions.
+ */
 import path from "path";
 import ts from "typescript";
 import fs from "fs";
-import { sha256 } from "@noble/hashes/sha2";
-import { bytesToHex } from "@noble/hashes/utils";
+import {
+  buildStableId,
+  collectBindingNames,
+  dedupe,
+  findClassMethodDecl,
+  findFunctionDecl,
+  findInterfaceDecl,
+  findVariableDecl,
+  getDeclarationHeader,
+  hasExportModifier,
+  isClassLike,
+  isPrivateOrLocalSymbol,
+  isStaticMember,
+  looksLikeEntrypoint,
+  makeImportStatement,
+  printClassLikePublicInterface,
+  resolveIfAlias,
+  resolveStableId,
+  shouldSkipAsLocal,
+} from "./utils.js";
 
 export type FoundExport = {
   exportName: string;
@@ -43,9 +138,6 @@ export type StableSymbolId = {
 
 export type Symbol = {
   id: StableSymbolId;
-  // name: string;
-  // kind: string;
-  // file: string;
   start: string;
   end: string;
   isExported: boolean;
@@ -54,7 +146,6 @@ export type Symbol = {
   declText: string; // the declaration text
   bodyText?: string; // function/method body, when present
   children?: Symbol[]; // child nodes in the symbol hierarchy
-  self: ts.Symbol;
   parent?: Symbol;
   paths?: AccessPath[];
 };
@@ -77,6 +168,17 @@ type RelatedItem = {
   column?: number;
 };
 
+/**
+ * Analyzer entry point for a TypeScript project.
+ *
+ * Responsibilities:
+ * - Parse tsconfig and build a Program/TypeChecker for the given projectDir.
+ * - Collect export roots (allRoots/valueRoots) used by path discovery and ranking.
+ * - Provide high-level APIs: list/find exports, pathsTo/pathsToRanked, related, listAllSymbols,
+ *   stable-id build/resolve, and import generation.
+ *
+ * Note: this class favors package-internal symbols and ignores node_modules externals.
+ */
 export class TypeScript {
   private program: ts.Program;
   private packageJson: any;
@@ -87,7 +189,7 @@ export class TypeScript {
   private valueRoots: FoundExport[];
 
   // Class field you can flip at runtime
-  private debug = true;
+  private debug = false;
 
   private dbg(...args: any[]) {
     if (this.debug) console.log("[TSX]", ...args);
@@ -115,6 +217,12 @@ export class TypeScript {
     }`;
   }
 
+  /**
+   * Create an analyzer for a project.
+   * - Locates and parses the provided tsconfig.
+   * - Creates a Program/TypeChecker limited to files under projectDir.
+   * - Pre-computes export roots (allRoots) and valueRoots (!isTypeOnly) for fast path search.
+   */
   constructor(projectDir: string, tsconfigName = "tsconfig.json") {
     this.projectDir = path.resolve(projectDir);
 
@@ -180,19 +288,37 @@ export class TypeScript {
     return findInterfaceDecl(this.program, absFilePath, ifaceName);
   }
 
-  /** Find exports with the exact exported name `name`. */
+  /** Find exports whose exported name exactly matches `name` (after alias resolution). */
   find(name: string): FoundExport[] {
     return this.collectExports((_exp, expName) => expName === name);
   }
 
-  /** List *all* exports of the package. */
+  /** List all exports in the project, including named/default/namespace and CommonJS export= assignments. */
   list(): FoundExport[] {
     return this.collectExports(() => true);
   }
 
   /**
-   * Given a declaration or symbol (e.g., the `create` method on `Completions`),
-   * return all access paths from exported surfaces to that symbol.
+   * Compute all consumer-facing access paths to a target declaration/symbol.
+   *
+   * Implementation details and heuristics:
+   * - Determines if the target has a runtime value; if not, only considers type roots (no BFS into members).
+   * - Augments the pre-collected roots with a synthetic direct submodule root if the target is exported
+   *   from its own source file (e.g. directly exported from that file).
+   * - Direct-hit optimization: if an exported symbol resolves to the target symbol (by declaration identity),
+   *   returns a path with zero member steps.
+   * - Exported variable aliasing: recognizes alias patterns via initializerTargetsSymbol() for:
+   *   Identifier, PropertyAccessExpression (obj.prop), ElementAccessExpression (obj["prop"]).
+   *   This allows paths like `export const create = client.create` to be discovered as direct paths.
+   * - BFS traversal:
+   *   - For class exports, traverses both static side (constructor function) and instance side
+   *     (by enqueuing the instance type via construct signatures).
+   *   - For each property:
+   *     - If callable, yields a call step (".foo(...)") only, avoiding a duplicate plain property step.
+   *       Direct-hit on callable compares both symbol and declaration identity.
+   *     - If non-callable, may produce a direct match step and enqueues its type for deeper traversal.
+   *   - Records whether construction is required (requiresNew) when traversing the instance side.
+   * - Dedupes resulting paths by moduleFile + exportName + pretty string.
    */
   pathsTo(target: ts.Symbol | ts.Declaration): AccessPath[] {
     const targetSym = this.toSymbol(target);
@@ -203,7 +329,7 @@ export class TypeScript {
     const targetResolved = this.resolveAlias(targetSym);
     const targetIsValue = this.symbolHasRuntimeValue(targetResolved);
 
-    const roots = targetIsValue ? this.valueRoots : this.allRoots;
+    const roots = [...(targetIsValue ? this.valueRoots : this.allRoots)];
 
     const paths: AccessPath[] = [];
 
@@ -387,6 +513,13 @@ export class TypeScript {
     return deduped;
   }
 
+  /**
+   * Determine whether a type/symbol is a primitive/global that should be ignored in public related() results.
+   * Heuristics:
+   * - Filters TS primitives (any/unknown/never/string/number/boolean/bigint/void/undefined/null/symbol).
+   * - Treats stdlib and external declaration files (outside projectDir) as global.
+   * - Skips common global containers (Promise, Map, Set, Array, Uint8Array).
+   */
   private isGlobalOrPrimitive(t: ts.Type, sym?: ts.Symbol): boolean {
     // primitives & ‘lib’ stuff
     if (
@@ -427,7 +560,14 @@ export class TypeScript {
     );
   }
 
-  /** Extract referenced *type* symbols from a type, including generics’ arguments. */
+  /**
+   * Extract referenced type symbols from a ts.Type.
+   * - Prefers alias symbols when present (aliasSymbol) to keep meaningful names.
+   * - Handles unions/intersections by visiting constituent types.
+   * - Handles generic references (TypeReference): collects target symbol and visits typeArguments.
+   * - Falls back to the type’s own symbol when applicable.
+   * Output is unique by first declaration identity.
+   */
   private typeTargets(t: ts.Type): ts.Symbol[] {
     const seenDecl = new Set<ts.Declaration>();
     const out: ts.Symbol[] = [];
@@ -499,9 +639,18 @@ export class TypeScript {
     return syms;
   }
 
-  /** Collect type *symbols* mentioned syntactically inside a TypeNode.
-   * Walks through utility types (Omit/Pick/Promise), unions/intersections,
-   * function types, type literals, mapped/conditional types, etc.
+  /**
+   * Deeply collect type symbols syntactically referenced inside a TypeNode.
+   * Coverage:
+   * - TypeReference (including QualifiedName): collects referenced symbol and recurses into typeArguments.
+   * - Array/Union/Intersection/Parenthesized types.
+   * - Function/Constructor types: parameter and return types.
+   * - TypeLiteral: property/method signatures and index signatures.
+   * - Mapped types, Indexed access types, Type operators (keyof/readonly/unique).
+   * - Conditional types (check/extends/true/false).
+   * - Type predicates (x is Y) via TypePredicateNode.
+   * - Type queries (typeof Foo) and ImportType ("import('mod').Foo").
+   * Results are unique by declaration identity; globals are not filtered here (higher-level filters apply).
    */
   private symbolsFromTypeNodeDeep(node: ts.TypeNode): ts.Symbol[] {
     const out: ts.Symbol[] = [];
@@ -621,6 +770,16 @@ export class TypeScript {
     return out;
   }
 
+  /**
+   * Determine whether a symbol corresponds to an anonymous/inline type shape.
+   * Considered anonymous:
+   * - Type literals ({ ... }) and method/property signatures within them
+   * - Function/method declarations or expressions used as inline types
+   * - Arrow functions used as inline types
+   * - JSDoc typedef tags
+   * Rationale: these shapes are internal implementation details and should not be surfaced
+   * as first-class “related” public API types.
+   */
   private isAnonymousTypeSym(sym: ts.Symbol): boolean {
     const d = sym.getDeclarations() ?? [];
     if (!d.length) return true;
@@ -704,6 +863,23 @@ export class TypeScript {
     return path.relative(this.projectDir, path.resolve(p)).replace(/\\/g, "/");
   }
 
+  /**
+   * Rank candidate access paths with human-centric heuristics.
+   * Scoring:
+   * - Bonuses:
+   *   - Entrypoints (index.ts, src/index.ts, or provided entrypoints) → strong bonus.
+   *   - Preferred root names ("default", "OpenAI" by default) → moderate bonus.
+   *   - Default export → bonus.
+   *   - Class export roots → slight bonus for values.
+   *   - If target is a type, add extra bonus for entrypoints/barrels.
+   * - Penalties:
+   *   - Long member chains (non-call steps) → length penalty.
+   *   - Private-ish steps (leading "_" or "#") → private penalty per step.
+   *   - Internal `_client` hops → client penalty.
+   *   - Deep folders (beyond package root) → depth penalty (stronger if target is a type).
+   *   - Namespace roots for types get a tiny penalty compared to named/entry exports.
+   * Sorts by descending score, then by shorter pretty string.
+   */
   private rankPaths(paths: AccessPath[], opts?: RankOptions): RankedPath[] {
     const entryset = new Set(
       (opts?.entrypoints ?? []).map((f) => path.resolve(f))
@@ -796,7 +972,7 @@ export class TypeScript {
     if (targetResolved)
       return this.rankPaths(raw, {
         ...opts,
-        targetIsType: this.symbolHasRuntimeValue(targetResolved),
+        targetIsType: !this.symbolHasRuntimeValue(targetResolved),
       });
     else return raw.map((s) => ({ ...s, score: 0 }));
   }
@@ -812,7 +988,11 @@ export class TypeScript {
   }
 
   // Try to determine whether an exported var's initializer resolves to the target symbol.
-  // Handles: Identifier (alias), PropertyAccess (obj.prop), ElementAccess (obj["prop"]).
+  // Recognizes common aliasing patterns used in barrels or surface shims.
+  // Handles:
+  // - Identifier: follows one-hop alias or variable initializer recursively.
+  // - PropertyAccess: matches by name on the property identifier.
+  // - ElementAccess with string literal: looks up property on the object type.
   private initializerTargetsSymbol(
     init: ts.Expression,
     target: ts.Symbol
@@ -865,6 +1045,14 @@ export class TypeScript {
     return this.initializerTargetsSymbol(d.initializer, target);
   }
 
+  /**
+   * Build a StableSymbolId for a declaration/symbol.
+   * Stable across formatting/line changes using:
+   * - project-relative file, kind, name, container chain
+   * - normalized declaration header hash
+   * - overload index among same-named siblings
+   * Includes export hints for better future resolution.
+   */
   buildStableId(target: ts.Symbol | ts.Declaration) {
     return buildStableId(
       this.program,
@@ -874,6 +1062,14 @@ export class TypeScript {
     );
   }
 
+  /**
+   * Enumerate all publicly-surfaced symbols across source files.
+   * - Visits file-scope declarations; skips locals via shouldSkipAsLocal and private members.
+   * - Includes: classes/interfaces/types/enums/functions/variables/modules.
+   * - Includes class members (methods/fields/accessors/index signatures/constructors).
+   * - Includes interface/type-literal members and members of object literals in exported consts.
+   * - Attaches documentation/tags, declaration header text, stable id, parent/children relations.
+   */
   listAllSymbols() {
     // Create a symbol map to track parent-child relationships
     const symbolMap = new Map<ts.Node, Symbol>();
@@ -921,7 +1117,6 @@ export class TypeScript {
       if (!id) throw new Error("Failed to build stable id");
       const symbol: Symbol = {
         id,
-        self: sym,
         // name: sym.getName(),
         // kind: ts.SyntaxKind[decl.kind],
         // file: path.relative(this.projectDir, sf.fileName),
@@ -1068,31 +1263,49 @@ export class TypeScript {
           });
         } else if (ts.isTypeAliasDeclaration(node)) {
           addRow(node.name, node, parent);
-          // If it's a type literal, also list its members
-          if (ts.isTypeLiteralNode(node.type)) {
-            for (const m of node.type.members) {
-              if (ts.isPropertySignature(m)) {
-                // name can be Identifier | StringLiteral | NumericLiteral | ComputedPropertyName
-                const nameNode = (m.name ??
-                  (m as unknown as ts.Node)) as ts.Node;
-                addRow(nameNode, m, node);
-              } else if (ts.isMethodSignature(m)) {
-                const nameNode = (m.name ??
-                  (m as unknown as ts.Node)) as ts.Node;
-                addRow(nameNode, m, node);
-              } else if (ts.isIndexSignatureDeclaration(m)) {
-                // No name node; pass the member itself so addRow falls back to decl.symbol
-                addRow(m as unknown as ts.Node, m as any, node);
+          // If the alias includes any inline type literal anywhere (including unions/intersections),
+          // enumerate its members as child symbols. This covers cases like:
+          //   type X = WebSocket & { ping?(): void; on?(event: 'pong', fn: () => void): any }
+          const addTypeLiteralMembersDeep = (tn: ts.TypeNode) => {
+            const walk = (n: ts.TypeNode) => {
+              if (ts.isTypeLiteralNode(n)) {
+                for (const m of n.members) {
+                  if (ts.isPropertySignature(m)) {
+                    // name can be Identifier | StringLiteral | NumericLiteral | ComputedPropertyName
+                    const nameNode = (m.name ?? (m as unknown as ts.Node)) as ts.Node;
+                    addRow(nameNode, m, node);
+                  } else if (ts.isMethodSignature(m)) {
+                    const nameNode = (m.name ?? (m as unknown as ts.Node)) as ts.Node;
+                    addRow(nameNode, m, node);
+                  } else if (ts.isIndexSignatureDeclaration(m)) {
+                    // No name node; pass the member itself so addRow falls back to decl.symbol
+                    addRow(m as unknown as ts.Node, m as any, node);
+                  }
+                  // Optionally include call/construct signatures declared in type literals
+                  else if (
+                    ts.isCallSignatureDeclaration(m) ||
+                    ts.isConstructSignatureDeclaration(m)
+                  ) {
+                    addRow(m as unknown as ts.Node, m as any, node);
+                  }
+                }
+                return;
               }
-              // (Optional) handle call/construct signatures if you want them listed:
-              else if (
-                ts.isCallSignatureDeclaration(m) ||
-                ts.isConstructSignatureDeclaration(m)
-              ) {
-                addRow(m as unknown as ts.Node, m as any, node);
+              // Unwrap parens
+              if (ts.isParenthesizedTypeNode(n)) {
+                walk(n.type);
+                return;
               }
-            }
-          }
+              // Traverse unions and intersections to find embedded type literals
+              if (ts.isIntersectionTypeNode(n) || ts.isUnionTypeNode(n)) {
+                for (const t of n.types) walk(t);
+                return;
+              }
+              // Other node kinds (TypeReference, MappedType, etc.) don't contain direct members to enumerate.
+            };
+            walk(tn);
+          };
+          if (node.type) addTypeLiteralMembersDeep(node.type);
         } else if (ts.isEnumDeclaration(node)) {
           addRow(node.name, node, parent);
           node.members.forEach((member) => {
@@ -1143,6 +1356,15 @@ export class TypeScript {
     return decls.some((d) => ts.isNamespaceExport(d));
   }
 
+  /**
+   * Collect all exports from each source file module.
+   * - Includes named/default exports and re-exports (checks getExportsOfModule).
+   * - Detects namespace re-exports (export * as ns from "./x") and treats them as namespace roots.
+   * - Determines type-only vs value exports via symbolHasRuntimeValue() on the resolved symbol.
+   * - Also scans for CommonJS `export =` assignments.
+   * - Provides reexportedFrom path when available to inform import statement generation.
+   * - Dedupes by moduleFile + exportName + importKind + type/value nature.
+   */
   private collectExports(
     filter: (exp: ts.Symbol, name: string) => boolean
   ): FoundExport[] {
@@ -1233,12 +1455,46 @@ export class TypeScript {
     );
   }
 
-  /** Return package-local *types* referenced by the public interface of `target`. */
+  /**
+   * Return package-local types referenced by the public interface of `target`.
+   *
+   * What is considered “related”:
+   * - For type aliases: all symbols referenced in the aliased type (deep traversal).
+   * - For interfaces: members’ parameter/return types, index signatures, and heritage (extends).
+   * - For classes: public members only (filters out private/protected and #private),
+   *   constructor parameter types, property types (declared or inferred), accessors, and heritage.
+   * - For functions/methods: parameters, return type; includes older TS predicate nodes (x is Y).
+   * - For variables: both declared/inferred type and value-side initializer chains
+   *   (e.g., i.generateSecretKey, a.b().c.d), plus constructor/new-expression targets.
+   * - Includes the container type (class/interface) for member declarations.
+   *
+   * Filters/constraints:
+   * - Excludes type parameters (T), primitives/globals/std libs (Promise, Map, Array, node/lib.d.ts),
+   *   and “anonymous”/inline type shapes.
+   * - inThisPackage() ensures symbols originate from the current project (not node_modules).
+   * - Value-side references are lenient (no alias resolution, skip anonymous filtering) but still
+   *   require top-level declarations from this package.
+   *
+   * Returns unique items by declaration identity with source location hints.
+   */
   public related(target: ts.Symbol | ts.Declaration): RelatedItem[] {
-    const sym = this.toSymbol(target);
-    if (!sym) return [];
-    const decl = sym.valueDeclaration ?? sym.declarations?.[0];
-    if (!decl) return [];
+    // If target is already a declaration, use it directly; otherwise get symbol and its first declaration
+    let decl: ts.Declaration;
+    let sym: ts.Symbol;
+    
+    if ((target as ts.Symbol).getDeclarations) {
+      // Target is a symbol
+      sym = target as ts.Symbol;
+      const firstDecl = sym.valueDeclaration ?? sym.declarations?.[0];
+      if (!firstDecl) return [];
+      decl = firstDecl;
+    } else {
+      // Target is a declaration - use it directly
+      decl = target as ts.Declaration;
+      const resolvedSym = this.toSymbol(target);
+      if (!resolvedSym) return [];
+      sym = resolvedSym;
+    }
 
     const addSet = new Map<ts.Declaration, RelatedItem>();
     const add = (s: ts.Symbol) => {
@@ -1472,12 +1728,21 @@ export class TypeScript {
       );
       if (sig) {
         const params = (decl as ts.SignatureDeclaration).parameters ?? [];
+        
+        // Process parameter types from type annotations (syntactic)
         for (const p of params)
           if (p.type) this.symbolsFromTypeNodeDeep(p.type).forEach(add);
 
-        // return type
-        const rt = sig.getReturnType();
-        this.typeTargets(rt).forEach(add);
+        // Process return type from type annotation (syntactic) if available
+        const functionLikeDecl = decl as ts.FunctionLikeDeclaration;
+        if (functionLikeDecl.type) {
+          // Use the syntactic type annotation to preserve type alias references
+          this.symbolsFromTypeNodeDeep(functionLikeDecl.type).forEach(add);
+        } else {
+          // Fallback to resolved type if no type annotation
+          const rt = sig.getReturnType();
+          this.typeTargets(rt).forEach(add);
+        }
 
         // type predicate: from node (older TS)
         addPredicateTypeFromNode(decl as any);
@@ -1562,6 +1827,10 @@ export class TypeScript {
     }
   }
 
+  /**
+   * Resolve the exported symbol object corresponding to a FoundExport entry.
+   * Uses the module SourceFile symbol table and returns the alias-resolved symbol.
+   */
   private getExportedSymbol(root: FoundExport): ts.Symbol | undefined {
     const sf = this.program.getSourceFile(root.moduleFile);
     if (!sf) return;
@@ -1574,6 +1843,13 @@ export class TypeScript {
     return match ? this.resolveAlias(match) : undefined;
   }
 
+  /**
+   * Normalize a declaration or symbol into a symbol.
+   * Attempts, in order:
+   * - If already a symbol, return it.
+   * - Resolve by declaration's name node via checker.getSymbolAtLocation.
+   * - Fallback to the declaration's .symbol (works for many decl kinds).
+   */
   private toSymbol(x: ts.Declaration | ts.Symbol): ts.Symbol | undefined {
     if ((x as ts.Symbol).getDeclarations) return x as ts.Symbol;
     const decl = x as ts.Declaration;
@@ -1585,6 +1861,11 @@ export class TypeScript {
     return (decl as any).symbol as ts.Symbol | undefined;
   }
 
+  /**
+   * Produce a stable-ish key for a type node during BFS over member graphs.
+   * - Combines whether construction is required with the type's symbol name and file.
+   * - De-dupes exploration of the same logical node across different traversal paths.
+   */
   private typeKey(t: ts.Type, requiresNew?: boolean): string {
     // Make a stable-ish key based on symbol + flags + requiresNew
     const s = t.getSymbol();
@@ -1596,6 +1877,12 @@ export class TypeScript {
     return `${requiresNew ? "new:" : "val:"}${id}`;
   }
 
+  /**
+   * For an export symbol, return the module specifier it re-exports from, if any.
+   * Supports both:
+   * - `export { x as y } from './mod'`
+   * - `export * as ns from './mod'`
+   */
   private getReexportSpecifier(exp: ts.Symbol): string | undefined {
     for (const d of exp.getDeclarations() ?? []) {
       if (
@@ -1617,6 +1904,13 @@ export class TypeScript {
     return undefined;
   }
 
+  /**
+   * Materialize an AccessPath object from a root export and its member steps.
+   * - Pretty-printing:
+   *   - If there are no steps and the root is callable, appends "(...)".
+   *   - Otherwise uses "[...]" to indicate a non-callable root value when leafless.
+   * - When requiresNew is true, renders "new <Root>(...)".
+   */
   private toAccessPath(
     root: FoundExport,
     steps: AccessStep[],
@@ -1648,6 +1942,10 @@ export class TypeScript {
     return { root, steps, requiresNew, pretty };
   }
 
+  /**
+   * Resolve a previously built StableSymbolId back to a live declaration/symbol in the current Program.
+   * Matches by kind/name/container chain/header hash, with a project-wide fallback if the file moved.
+   */
   resolveStableId(
     id: StableSymbolId
   ): { decl: ts.Declaration; symbol: ts.Symbol } | undefined {
@@ -1665,6 +1963,14 @@ export class TypeScript {
     return printClassLikePublicInterface(classNode, this.checker, opts);
   }
 
+  /**
+   * Generate an import statement for a FoundExport.
+   * Handles:
+   * - default vs named vs namespace vs CommonJS export=
+   * - trimming file extensions and /index suffixes
+   * - respecting rootDir/src/packageRoot for module specifier construction
+   * When packageName is provided, emits package-based specifiers (e.g., "lib/foo").
+   */
   makeImportStatement(exp: FoundExport, packageName?: string): string {
     return makeImportStatement(exp, {
       program: this.program,
@@ -1891,1183 +2197,16 @@ export class TypeScript {
     return out;
   }
 
+  /** Access the underlying ts.Program. */
   getProgram(): ts.Program {
     return this.program;
   }
+  /** The parsed package.json at project root. */
   getPackageJson(): any {
     return this.packageJson;
   }
+  /** Compiler options used by the Program. */
   getOptions(): ts.CompilerOptions {
     return this.options;
   }
-}
-
-export function getDeclarationHeader(
-  decl: ts.Declaration,
-  sf: ts.SourceFile
-): string {
-  const src = sf.text;
-  const start = decl.getStart(sf);
-
-  // 1) class / interface / enum: slice before body "{"
-  if (
-    ts.isClassDeclaration(decl) ||
-    ts.isInterfaceDeclaration(decl) ||
-    ts.isEnumDeclaration(decl)
-  ) {
-    const bodyStart = decl.members.pos; // right after "{"
-    return src.slice(start, bodyStart).trim();
-  }
-
-  // 2) type alias: stop before type-literal/mapped-type "{"
-  if (ts.isTypeAliasDeclaration(decl)) {
-    const t = decl.type;
-    if (t && (ts.isTypeLiteralNode(t) || ts.isMappedTypeNode(t))) {
-      const bracePos = t.getStart(sf); // at "{"
-      return src.slice(start, bracePos).trim(); // "type X ="
-    }
-    // generic fallback: just header "type X ="
-    const eqIdx = src.indexOf("=", start);
-    if (eqIdx > -1 && eqIdx < decl.end)
-      return src.slice(start, eqIdx + 1).trim();
-    return `type ${decl.name.getText(sf)}`.trim();
-  }
-
-  // 3) function-like with a Block body: slice before the body block
-  if (
-    (ts.isFunctionDeclaration(decl) ||
-      ts.isMethodDeclaration(decl) ||
-      ts.isGetAccessorDeclaration(decl) ||
-      ts.isSetAccessorDeclaration(decl) ||
-      ts.isConstructorDeclaration(decl) ||
-      ts.isFunctionExpression(decl)) &&
-    decl.body &&
-    ts.isBlock(decl.body)
-  ) {
-    const bodyStart = decl.body.pos; // just after "{"
-    return src.slice(start, bodyStart).trim(); // "export function parse(...): { ... }"
-  }
-
-  // 4) Arrow function: slice up to the "=>"
-  if (ts.isArrowFunction(decl)) {
-    const arrowPos = decl.equalsGreaterThanToken.getStart(sf);
-    return src.slice(start, arrowPos).trim();
-  }
-
-  // 5) Variable with object-literal initializer: slice before "{"
-  if (
-    ts.isVariableDeclaration(decl) &&
-    decl.initializer &&
-    ts.isObjectLiteralExpression(decl.initializer)
-  ) {
-    const objStart = decl.initializer.getStart(sf); // at "{"
-    return src.slice(start, objStart).trim(); // "export const NostrTypeGuard ="
-  }
-
-  // 6) Object-literal property with arrow/function initializer: trim initializer body
-  if (ts.isPropertyAssignment(decl)) {
-    const init = decl.initializer;
-    const propStart = decl.getStart(sf, true);
-    if (init && ts.isArrowFunction(init)) {
-      const arrowPos = init.equalsGreaterThanToken.getStart(sf);
-      return src.slice(propStart, arrowPos).trim(); // "isNProfile: (v?: ...): v is NProfile"
-    }
-    if (init && ts.isFunctionExpression(init)) {
-      if (init.body && ts.isBlock(init.body)) {
-        const bodyStart = init.body.pos;
-        return src.slice(propStart, bodyStart).trim(); // "isNProfile: function(...): T"
-      }
-      // no block body (unlikely), fall through
-    }
-  }
-
-  // Method signature in the interface
-  if (ts.isMethodSignature(decl)) {
-    // collapse huge inline return type literals to "{ … }"
-    const base = src.slice(start, decl.end).trim();
-    // if you want to collapse a type-literal return: detect `: {` and replace till matching '}'
-    return base; // signatures have no body anyway
-  }
-
-  // 7) Fallback: declarations without bodies (overloads, ambient) are fine as-is
-  return decl.getText(sf);
-}
-/** True if `node` is declared at file/public-surface scope (not a local). */
-function isFileScopeDeclaration(
-  node: ts.Node,
-  opts?: { allowNamespaces?: boolean }
-): boolean {
-  let cur: ts.Node | undefined = node.parent;
-
-  while (cur) {
-    // Reached a file container → file scope
-    if (ts.isSourceFile(cur)) return true;
-
-    // Namespace/module blocks: treat as file scope if allowed
-    if (ts.isModuleBlock(cur)) return !!opts?.allowNamespaces;
-
-    // Public-surface containers → their members are not locals
-    if (ts.isClassDeclaration(cur) || ts.isClassExpression(cur)) return true;
-    if (ts.isInterfaceDeclaration(cur)) return true;
-    if (ts.isTypeLiteralNode(cur)) return true; // <--- NEW
-    if (ts.isEnumDeclaration(cur)) return true;
-
-    // Function-like → locals
-    if (isFunctionLikeNode(cur)) return false;
-    if (ts.isBlock(cur) && cur.parent && isFunctionLikeNode(cur.parent))
-      return false;
-
-    // Top-level statement container (non-decl) → locals
-    if (isTopLevelNonDeclStmt(cur)) return false;
-
-    cur = cur.parent;
-  }
-  return false;
-}
-
-function shouldSkipAsLocal(node: ts.Node): boolean {
-  // Never skip type members (interface / type-literal)
-  if (ts.isTypeElement(node)) return false;
-  return !isFileScopeDeclaration(node, { allowNamespaces: true });
-}
-
-/**
- * Determines if a symbol is private (private class member) or local (local variable)
- * @param decl The declaration to check
- * @returns true if the symbol is private or local and should be skipped
- */
-function isPrivateOrLocalSymbol(decl: ts.Declaration): boolean {
-  // Check for private modifier on class members
-  if (ts.getCombinedModifierFlags(decl) & ts.ModifierFlags.Private) {
-    return true;
-  }
-
-  // Check for private identifier (# prefix) on class property
-  if (
-    (ts.isPropertyDeclaration(decl) ||
-      ts.isMethodDeclaration(decl) ||
-      ts.isGetAccessorDeclaration(decl) ||
-      ts.isSetAccessorDeclaration(decl)) &&
-    ts.isPrivateIdentifier(decl.name)
-  ) {
-    return true;
-  }
-
-  // Check for local variables (variables inside functions)
-  if (ts.isVariableDeclaration(decl)) {
-    // Walk up the tree to see if this variable is inside a function
-    let parent: ts.Node | undefined = decl.parent;
-    while (parent) {
-      if (
-        ts.isFunctionDeclaration(parent) ||
-        ts.isMethodDeclaration(parent) ||
-        ts.isFunctionExpression(parent) ||
-        ts.isArrowFunction(parent)
-      ) {
-        // It's a local variable inside a function
-        return true;
-      }
-      parent = parent.parent;
-    }
-  }
-
-  return false;
-}
-
-function hasExportModifier(decl: ts.Declaration): boolean {
-  const mods = ts.getCombinedModifierFlags(decl);
-  return (
-    (mods & ts.ModifierFlags.Export) !== 0 ||
-    (mods & ts.ModifierFlags.Default) !== 0
-  );
-}
-
-function collectBindingNames(
-  name: ts.BindingName,
-  onId: (id: ts.Identifier) => void
-) {
-  if (ts.isIdentifier(name)) {
-    onId(name);
-  } else if (ts.isArrayBindingPattern(name)) {
-    for (const e of name.elements) {
-      if (ts.isOmittedExpression(e)) continue;
-      if (e.name) collectBindingNames(e.name, onId);
-    }
-  } else if (ts.isObjectBindingPattern(name)) {
-    for (const p of name.elements) {
-      collectBindingNames(p.name, onId);
-    }
-  }
-}
-
-// Simple array dedupe by key
-function dedupe<T>(arr: T[], key: (t: T) => string): T[] {
-  const seen = new Set<string>();
-  const out: T[] = [];
-  for (const item of arr) {
-    const k = key(item);
-    if (!seen.has(k)) {
-      seen.add(k);
-      out.push(item);
-    }
-  }
-  return out;
-}
-
-export function findClassDecl(
-  program: ts.Program,
-  absFilePath: string,
-  className: string
-): ts.ClassDeclaration | undefined {
-  const sf = program.getSourceFile(path.resolve(absFilePath));
-  if (!sf) return;
-  let out: ts.ClassDeclaration | undefined;
-
-  sf.forEachChild(function walk(node) {
-    if (ts.isClassDeclaration(node) && node.name?.text === className) {
-      out = node;
-    }
-    ts.forEachChild(node, walk);
-  });
-  return out;
-}
-
-export function findClassMethodDecl(
-  program: ts.Program,
-  absFilePath: string,
-  className: string, // pass "JS"; if you really have an anonymous default class, pass "" to match any
-  methodName: string // e.g. "generateSecretKey"
-): ts.MethodDeclaration | undefined {
-  const sf = program.getSourceFile(path.resolve(absFilePath));
-  if (!sf) return;
-
-  let found: ts.MethodDeclaration | undefined;
-
-  const visit = (node: ts.Node) => {
-    // Case 1: class declaration (named or default)
-    if (ts.isClassDeclaration(node)) {
-      const matchesName = className ? node.name?.text === className : true;
-      if (matchesName) {
-        const m = findMethodInClass(node, methodName);
-        if (m) {
-          found = m;
-          return;
-        }
-      }
-    }
-
-    // Case 2: const JS = class (...) { ... }  OR  export const JS = class { ... }
-    if (ts.isVariableStatement(node)) {
-      for (const d of node.declarationList.declarations) {
-        if (!ts.isIdentifier(d.name)) continue;
-        if (className && d.name.text !== className) continue;
-        if (d.initializer && ts.isClassExpression(d.initializer)) {
-          const m = findMethodInClass(d.initializer, methodName);
-          if (m) {
-            found = m;
-            return;
-          }
-        }
-      }
-    }
-
-    // Case 3: export default class { ... } with no name, but caller provided the name:
-    // We can’t match by name; if className is empty, accept any default class in file.
-    // (Handled by Case 1 when className === "")
-
-    if (!found) ts.forEachChild(node, visit);
-  };
-
-  visit(sf);
-  return found;
-}
-
-function findMethodInClass(
-  cls: ts.ClassDeclaration | ts.ClassExpression,
-  methodName: string
-): ts.MethodDeclaration | undefined {
-  for (const member of cls.members) {
-    // methods like: generateSecretKey() { ... }  or async generateSecretKey() { ... }
-    if (
-      ts.isMethodDeclaration(member) &&
-      ts.isIdentifier(member.name) &&
-      member.name.text === methodName
-    ) {
-      return member;
-    }
-    // If someone wrote it as a property with an arrow function:
-    // generateSecretKey = () => { ... }
-    if (
-      ts.isPropertyDeclaration(member) &&
-      ts.isIdentifier(member.name) &&
-      member.name.text === methodName
-    ) {
-      if (member.initializer && ts.isArrowFunction(member.initializer)) {
-        // You can return the property declaration or wrap it to a synthetic “method” if you prefer
-        return undefined; // or cast if your later code handles PropertyDeclaration
-      }
-    }
-  }
-  return undefined;
-}
-
-export function findFunctionDecl(
-  program: ts.Program,
-  absFilePath: string,
-  fnName: string
-): ts.FunctionDeclaration | undefined {
-  const sf = program.getSourceFile(path.resolve(absFilePath));
-  if (!sf) return;
-  let out: ts.FunctionDeclaration | undefined;
-
-  sf.forEachChild(function walk(node) {
-    if (ts.isFunctionDeclaration(node) && node.name?.text === fnName) {
-      out = node;
-    }
-    ts.forEachChild(node, walk);
-  });
-  return out;
-}
-
-export function findVariableDecl(
-  program: ts.Program,
-  absFilePath: string,
-  varName: string
-): ts.VariableDeclaration | undefined {
-  const sf = program.getSourceFile(path.resolve(absFilePath));
-  if (!sf) return;
-  let out: ts.VariableDeclaration | undefined;
-
-  sf.forEachChild(function walk(node) {
-    if (ts.isVariableStatement(node)) {
-      for (const decl of node.declarationList.declarations) {
-        if (ts.isIdentifier(decl.name) && decl.name.text === varName) {
-          out = decl;
-        }
-      }
-    }
-    ts.forEachChild(node, walk);
-  });
-  return out;
-}
-
-export function findInterfaceDecl(
-  program: ts.Program,
-  absFilePath: string,
-  ifaceName: string
-): ts.InterfaceDeclaration | undefined {
-  const sf = program.getSourceFile(path.resolve(absFilePath));
-  if (!sf) return;
-  let out: ts.InterfaceDeclaration | undefined;
-
-  sf.forEachChild(function walk(node) {
-    if (ts.isInterfaceDeclaration(node) && node.name.text === ifaceName) {
-      out = node;
-    }
-    ts.forEachChild(node, walk);
-  });
-  return out;
-}
-
-/** Utility: is this a file likely to be an entrypoint, by heuristics */
-function looksLikeEntrypoint(rel: string): boolean {
-  // favor index.ts at repo root or src/index.ts, and top-level files in general
-  return (
-    rel === "index.ts" ||
-    rel === "src/index.ts" ||
-    /^index\.(ts|tsx|mts|cts)$/.test(rel.split("/").pop() || "")
-  );
-}
-
-// --- helpers you already have / similar ---
-function projectRel(projectDir: string, file: string) {
-  return path.relative(projectDir, path.resolve(file)).replace(/\\/g, "/");
-}
-
-function normalizeHeaderText(txt: string): string {
-  // Strip comments and collapse whitespace to stabilize
-  const noComments = txt
-    // /* ... */ (not perfect but fine for headers)
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    // // ...
-    .replace(/(^|\s)\/\/.*$/gm, "");
-  return noComments.replace(/\s+/g, " ").trim();
-}
-
-function hashHeader(txt: string): string {
-  return bytesToHex(sha256(normalizeHeaderText(txt))).slice(0, 16);
-}
-
-// Walk up containers (class/interface/module)
-function containerChainOf(
-  decl: ts.Declaration,
-  checker: ts.TypeChecker
-): Array<{ kind: ts.SyntaxKind; name: string }> {
-  const out: Array<{ kind: ts.SyntaxKind; name: string }> = [];
-  let cur: ts.Node | undefined = decl.parent;
-  while (cur && !ts.isSourceFile(cur)) {
-    if (ts.isClassDeclaration(cur) && cur.name)
-      out.push({ kind: cur.kind, name: cur.name.text });
-    else if (ts.isInterfaceDeclaration(cur))
-      out.push({ kind: cur.kind, name: cur.name.text });
-    else if (ts.isModuleDeclaration(cur))
-      out.push({ kind: cur.kind, name: cur.name.getText() });
-    else if (ts.isEnumDeclaration(cur))
-      out.push({ kind: cur.kind, name: cur.name.text });
-    cur = cur.parent;
-  }
-  return out.reverse();
-}
-
-function declName(decl: ts.Declaration, checker: ts.TypeChecker): string {
-  const nameNode = (decl as any).name as ts.Node | undefined;
-
-  // Constructor has no name node
-  if (ts.isConstructorDeclaration(decl)) {
-    return "constructor";
-  }
-
-  if (nameNode) {
-    if (ts.isIdentifier(nameNode)) return nameNode.text;
-    if (ts.isStringLiteral(nameNode) || ts.isNumericLiteral(nameNode)) {
-      return nameNode.text;
-    }
-    if (ts.isComputedPropertyName(nameNode)) {
-      const expr = nameNode.expression;
-      return `[${ts.isIdentifier(expr) ? expr.text : expr.getText()}]`;
-    }
-  }
-
-  // export { a as b } from '...'
-  if (ts.isExportSpecifier(decl)) {
-    // the exported name (rhs of `as`) is what consumers see
-    return (decl.name ?? decl.propertyName)?.getText() ?? "<anonymous>";
-  }
-
-  if (ts.isExportAssignment(decl)) return "export=";
-
-  if (ts.isIndexSignatureDeclaration(decl)) {
-    const p = decl.parameters?.[0];
-    if (p && ts.isIdentifier(p.name)) return `[${p.name.text}]`;
-    return "[index]";
-  }
-
-  return "<anonymous>";
-}
-
-function symbolFromTarget(
-  checker: ts.TypeChecker,
-  target: ts.Symbol | ts.Declaration
-): ts.Symbol | undefined {
-  // Already a symbol?
-  if ((target as ts.Symbol).getDeclarations) return target as ts.Symbol;
-
-  const decl = target as ts.Declaration;
-
-  // Most declarations (incl. default exports) have a .symbol
-  const direct = (decl as any).symbol as ts.Symbol | undefined;
-  if (direct) return direct;
-
-  // Try the declaration's "name" node (handles identifiers, string names, computed names, etc.)
-  const getNameOfDecl = (ts as any).getNameOfDeclaration as
-    | ((d: ts.Declaration) => ts.Node | undefined)
-    | undefined;
-
-  const nameNode =
-    getNameOfDecl?.(decl) ??
-    // Fallback for older TS: try common cases
-    (ts.isFunctionDeclaration(decl) && decl.name
-      ? decl.name
-      : ts.isClassDeclaration(decl) && decl.name
-      ? decl.name
-      : ts.isInterfaceDeclaration(decl)
-      ? decl.name
-      : ts.isTypeAliasDeclaration(decl)
-      ? decl.name
-      : ts.isEnumDeclaration(decl)
-      ? decl.name
-      : undefined);
-
-  if (nameNode) {
-    const byName = checker.getSymbolAtLocation(nameNode);
-    if (byName) return byName;
-  }
-
-  // Variable declarations may use binding patterns. Handle all cases explicitly.
-  if (ts.isVariableDeclaration(decl)) {
-    const bn = decl.name;
-
-    // const id = ...
-    if (ts.isIdentifier(bn)) {
-      const s = checker.getSymbolAtLocation(bn);
-      if (s) return s;
-    }
-
-    // const { a, b: c, ...rest } = ...
-    if (ts.isObjectBindingPattern(bn)) {
-      for (const el of bn.elements) {
-        // el.name can be Identifier | BindingPattern
-        if (ts.isIdentifier(el.name)) {
-          const s = checker.getSymbolAtLocation(el.name);
-          if (s) return s; // return first identifier in the pattern
-        } else if (
-          ts.isObjectBindingPattern(el.name) ||
-          ts.isArrayBindingPattern(el.name)
-        ) {
-          // nested pattern: dive one level to find an identifier
-          for (const nested of el.name.elements) {
-            if (ts.isBindingElement(nested) && ts.isIdentifier(nested.name)) {
-              const s = checker.getSymbolAtLocation(nested.name);
-              if (s) return s;
-            }
-          }
-        }
-      }
-    }
-
-    // const [a, , c] = ...
-    if (ts.isArrayBindingPattern(bn)) {
-      for (const el of bn.elements) {
-        if (ts.isOmittedExpression(el)) continue;
-        if (ts.isBindingElement(el) && ts.isIdentifier(el.name)) {
-          const s = checker.getSymbolAtLocation(el.name);
-          if (s) return s;
-        }
-        if (
-          ts.isBindingElement(el) &&
-          (ts.isObjectBindingPattern(el.name) ||
-            ts.isArrayBindingPattern(el.name))
-        ) {
-          for (const nested of el.name.elements) {
-            if (ts.isBindingElement(nested) && ts.isIdentifier(nested.name)) {
-              const s = checker.getSymbolAtLocation(nested.name);
-              if (s) return s;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Last-resort: sometimes the checker can resolve the decl node itself
-  try {
-    const s = checker.getSymbolAtLocation(decl as unknown as ts.Node);
-    if (s) return s;
-  } catch {}
-
-  return undefined;
-}
-
-export function buildStableId(
-  program: ts.Program,
-  projectDir: string,
-  target: ts.Symbol | ts.Declaration,
-  listExports?: () => Array<{
-    moduleFile: string;
-    exportName: string;
-    symbol: ts.Symbol;
-  }>
-): StableSymbolId | undefined {
-  const checker = program.getTypeChecker();
-  const sym = symbolFromTarget(checker, target);
-  if (!sym) return;
-
-  const decl = sym.valueDeclaration ?? sym.declarations?.[0];
-  if (!decl) return;
-  const sf = decl.getSourceFile();
-
-  const header = getDeclarationHeader(decl, sf);
-  const headerHash = hashHeader(header);
-
-  // overload index among same-name declarations in this container/file
-  let overloadIndex = 0;
-  if (ts.isFunctionDeclaration(decl) || ts.isMethodDeclaration(decl)) {
-    const siblings = (decl.parent as ts.Node)
-      .getChildren()
-      .filter(
-        (n) =>
-          (ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n)) &&
-          (n as any).name?.getText(sf) === declName(decl, checker)
-      ) as Array<typeof decl>;
-    if (siblings.length > 1) {
-      // sort by normalized header to get stable ordering
-      const sorted = [...siblings].sort((a, b) =>
-        normalizeHeaderText(getDeclarationHeader(a, sf)).localeCompare(
-          normalizeHeaderText(getDeclarationHeader(b, sf))
-        )
-      );
-      overloadIndex = sorted.indexOf(decl);
-    }
-  }
-
-  // optional export hints
-  let exportHints: StableSymbolId["exportHints"] | undefined;
-  if (listExports) {
-    const hints = [];
-    const target = resolveIfAlias(checker, sym);
-    for (const e of listExports()) {
-      const expResolved = resolveIfAlias(checker, e.symbol);
-      if (sameSymbol(checker, expResolved, target)) {
-        hints.push({
-          moduleFile: projectRel(projectDir, e.moduleFile),
-          exportName: e.exportName,
-        });
-      }
-    }
-    if (hints.length) exportHints = hints;
-  }
-
-  const stableId: StableSymbolId = {
-    hash: "",
-    file: projectRel(projectDir, sf.fileName),
-    kind: ts.SyntaxKind[decl.kind],
-    name: declName(decl, checker),
-    containerChain: containerChainOf(decl, checker),
-    headerHash,
-    exportHints,
-    overloadIndex,
-  };
-  stableId.hash = createSymbolIdHash(stableId);
-  return stableId;
-}
-
-function resolveIfAlias(checker: ts.TypeChecker, s: ts.Symbol): ts.Symbol {
-  return s.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(s) : s;
-}
-
-function sameSymbol(
-  checker: ts.TypeChecker,
-  a?: ts.Symbol,
-  b?: ts.Symbol
-): boolean {
-  if (!a || !b) return false;
-  // Compare by first declaration identity (robust across aliases)
-  const ar = resolveIfAlias(checker, a);
-  const br = resolveIfAlias(checker, b);
-  const ad = ar.getDeclarations()?.[0];
-  const bd = br.getDeclarations()?.[0];
-  return !!ad && !!bd && ad === bd;
-}
-
-export function resolveStableId(
-  program: ts.Program,
-  projectDir: string,
-  id: StableSymbolId
-): { decl: ts.Declaration; symbol: ts.Symbol } | undefined {
-  const checker = program.getTypeChecker();
-  const file = program.getSourceFile(path.resolve(projectDir, id.file));
-  const candidates: ts.Declaration[] = [];
-
-  const considerDecl = (decl: ts.Declaration) => {
-    if (ts.SyntaxKind[decl.kind] !== id.kind) return;
-
-    const nameNode =
-      (ts as any).getNameOfDeclaration?.(decl) ??
-      (ts.isMethodSignature(decl) ||
-      ts.isMethodDeclaration(decl) ||
-      ts.isFunctionDeclaration(decl)
-        ? (decl as any).name
-        : undefined);
-    const name =
-      nameNode && ts.isIdentifier(nameNode) ? nameNode.text : "<anonymous>";
-    if (name !== id.name) return;
-
-    const cc = containerChainOf(decl, checker);
-    if (JSON.stringify(cc) !== JSON.stringify(id.containerChain)) return;
-
-    const hdr = getDeclarationHeader(decl, decl.getSourceFile());
-    const hash = hashHeader(hdr);
-    if (hash !== id.headerHash) return;
-
-    candidates.push(decl);
-  };
-
-  if (file) {
-    // fast path: search only in that file
-    const visit = (n: ts.Node) => {
-      // cheap filter by kind & name
-      if (
-        ts.isClassDeclaration(n) ||
-        ts.isInterfaceDeclaration(n) ||
-        ts.isEnumDeclaration(n) ||
-        ts.isTypeAliasDeclaration(n) ||
-        ts.isFunctionDeclaration(n) ||
-        ts.isMethodDeclaration(n) ||
-        ts.isMethodSignature(n) ||
-        ts.isPropertyDeclaration(n) ||
-        ts.isPropertySignature(n) ||
-        ts.isVariableDeclaration(n)
-      )
-        considerDecl(n as ts.Declaration);
-      ts.forEachChild(n, visit);
-    };
-    visit(file);
-  }
-
-  // fallback: if nothing found (file moved), do a project-wide scan using name/kind/container/hash
-  if (!candidates.length) {
-    for (const sf of program.getSourceFiles()) {
-      if (sf.isDeclarationFile) continue;
-      const visit = (n: ts.Node) => {
-        if (
-          ts.isClassDeclaration(n) ||
-          ts.isInterfaceDeclaration(n) ||
-          ts.isEnumDeclaration(n) ||
-          ts.isTypeAliasDeclaration(n) ||
-          ts.isFunctionDeclaration(n) ||
-          ts.isMethodDeclaration(n) ||
-          ts.isPropertyDeclaration(n) ||
-          ts.isVariableDeclaration(n)
-        )
-          considerDecl(n as ts.Declaration);
-        ts.forEachChild(n, visit);
-      };
-      visit(sf);
-      if (candidates.length) break;
-    }
-  }
-
-  // disambiguate overloads if present
-  if (candidates.length > 1 && typeof id.overloadIndex === "number") {
-    const sorted = [...candidates].sort((a, b) =>
-      normalizeHeaderText(
-        getDeclarationHeader(a, a.getSourceFile())
-      ).localeCompare(
-        normalizeHeaderText(getDeclarationHeader(b, b.getSourceFile()))
-      )
-    );
-    const pick = sorted[id.overloadIndex] ?? sorted[0];
-    return {
-      decl: pick,
-      symbol:
-        ((pick as any).symbol as ts.Symbol) ??
-        checker.getSymbolAtLocation((pick as any).name),
-    };
-  }
-
-  const decl = candidates[0];
-  if (!decl) return undefined;
-  return {
-    decl,
-    symbol:
-      ((decl as any).symbol as ts.Symbol) ??
-      checker.getSymbolAtLocation((decl as any).name),
-  };
-}
-
-export function createSymbolIdHash(id: StableSymbolId) {
-  let data = `${id.file}:${id.kind}:${id.name}:${id.headerHash}:${
-    id.overloadIndex || 0
-  }`;
-  for (const c of id.containerChain) data += `:${c.kind}:${c.name}`;
-  return bytesToHex(sha256(data));
-}
-
-export function equalStableId(a: StableSymbolId, b: StableSymbolId): boolean {
-  if (a.hash && b.hash) return a.hash === b.hash;
-
-  // Compare declaration kind
-  if (a.kind !== b.kind) return false;
-
-  // Compare name
-  if (a.name !== b.name) return false;
-
-  // Compare container chain length + items
-  if (a.containerChain.length !== b.containerChain.length) return false;
-  for (let i = 0; i < a.containerChain.length; i++) {
-    const ac = a.containerChain[i];
-    const bc = b.containerChain[i];
-    if (ac.kind !== bc.kind || ac.name !== bc.name) return false;
-  }
-
-  // Compare header hash
-  if (a.headerHash !== b.headerHash) return false;
-
-  // Compare overload index
-  if ((a.overloadIndex ?? 0) !== (b.overloadIndex ?? 0)) return false;
-
-  // File path: treat project-relative path as primary key.
-  // If file moved, you may want to ignore this, but by default include it.
-  if (a.file !== b.file) return false;
-
-  return true;
-}
-
-/** Print a class's public interface (header + public members, no bodies).
- *  Works for ClassDeclaration and ClassExpression (assigned to a variable).
- *  If it's a class expression assigned to `const X = class Foo ...`, we render `export class X ... { ... }`
- *  so docs reflect how the API is actually used.
- */
-export function printClassLikePublicInterface(
-  classNode: ts.ClassDeclaration | ts.ClassExpression,
-  checker: ts.TypeChecker,
-  opts: {
-    includeStatic?: boolean;
-    includeConstructor?: boolean;
-    preferOuterVarNameForClassExpression?: boolean; // default: true
-  } = {}
-): string {
-  const sf = classNode.getSourceFile();
-  const includeStatic = opts.includeStatic ?? true;
-  const includeCtor = opts.includeConstructor ?? true;
-  const preferOuter = opts.preferOuterVarNameForClassExpression ?? true;
-
-  // --- Determine header context/name/modifiers ---
-  // Default to the class node's own name (may be undefined for anonymous class exprs)
-  let renderedName = classNode.name?.text;
-  let exportPrefix = "";
-
-  // If it's a class expression assigned to a variable, prefer the variable name (what consumers use)
-  if (ts.isClassExpression(classNode) && preferOuter) {
-    const vd = findEnclosingVariableDeclaration(classNode);
-    if (vd && ts.isIdentifier(vd.name)) {
-      renderedName = vd.name.text;
-      // Pull `export` from the VariableStatement modifiers
-      const vs = findAncestor<ts.VariableStatement>(vd, ts.isVariableStatement);
-      if (vs) {
-        const isExport = vs.modifiers?.some(
-          (m) => m.kind === ts.SyntaxKind.ExportKeyword
-        );
-        const isDefault = vs.modifiers?.some(
-          (m) => m.kind === ts.SyntaxKind.DefaultKeyword
-        );
-        if (isExport && isDefault) {
-          exportPrefix = "export default ";
-        } else if (isExport) {
-          exportPrefix = "export ";
-        }
-      }
-    }
-  }
-
-  // Fallback synthetic name if still anonymous
-  if (!renderedName) renderedName = "/*anonymous*/";
-
-  // Build the class header text up to `{`, but replace the name token with `renderedName`
-  const rawHeader = sf.text
-    .slice(classNode.getStart(sf, true), classNode.members.pos - 1)
-    .trim();
-  const header = replaceClassNameInHeader(
-    rawHeader,
-    classNode.name?.getText(sf),
-    renderedName
-  );
-
-  // --- Collect public members (no bodies/initializers) ---
-  const lines: string[] = [];
-  for (const m of classNode.members) {
-    if (!isPublicMember(m)) continue;
-
-    const isStatic =
-      (ts.getCombinedModifierFlags(m) & ts.ModifierFlags.Static) !== 0;
-    if (!includeStatic && isStatic) continue;
-
-    // Constructor
-    if (ts.isConstructorDeclaration(m)) {
-      if (!includeCtor) continue;
-      lines.push(indent(sliceBeforeBody(m, sf).trim().replace(/\s*$/, ";")));
-      continue;
-    }
-
-    // Methods / accessors: header only
-    if (
-      (ts.isMethodDeclaration(m) ||
-        ts.isGetAccessorDeclaration(m) ||
-        ts.isSetAccessorDeclaration(m)) &&
-      isIdentifierName(m.name)
-    ) {
-      lines.push(indent(sliceBeforeBody(m, sf).trim().replace(/\s*$/, ";")));
-      continue;
-    }
-
-    // Properties / fields: drop initializer, ensure type (infer if missing)
-    if (ts.isPropertyDeclaration(m) && isIdentifierName(m.name)) {
-      const base = sliceBeforeInitializer(m, sf).trim();
-      let line = base;
-      if (!hasTypeAnnotation(base)) {
-        const sym = (m as any).symbol as ts.Symbol | undefined;
-        const t = sym
-          ? checker.getTypeOfSymbolAtLocation(sym, m)
-          : checker.getTypeAtLocation(m);
-        line = `${base}: ${checker.typeToString(t)}`;
-      }
-      lines.push(indent(ensureSemicolon(line)));
-      continue;
-    }
-
-    // Index signature in class (rare)
-    if (ts.isIndexSignatureDeclaration(m)) {
-      lines.push(indent(m.getText(sf).replace(/\{[\s\S]*\}$/, ";")));
-      continue;
-    }
-  }
-
-  return `${exportPrefix}${header}{\n${lines.join("\n")}\n}`;
-}
-
-// ---------- helpers ----------
-
-function isPublicMember(m: ts.ClassElement): boolean {
-  const mods = ts.getCombinedModifierFlags(m);
-  if (mods & ts.ModifierFlags.Private || mods & ts.ModifierFlags.Protected)
-    return false;
-  const name = (m as any).name as ts.Node | undefined;
-  if (name && ts.isPrivateIdentifier(name)) return false; // #private
-  return true;
-}
-
-function isIdentifierName(
-  n: ts.PropertyName | ts.BindingName | undefined
-): n is ts.Identifier {
-  return !!n && ts.isIdentifier(n);
-}
-
-function sliceBeforeBody(
-  node:
-    | ts.MethodDeclaration
-    | ts.GetAccessorDeclaration
-    | ts.SetAccessorDeclaration
-    | ts.ConstructorDeclaration,
-  sf: ts.SourceFile
-): string {
-  if (!node.body) return node.getText(sf);
-  const start = node.getStart(sf, true);
-  const bodyStart = node.body.pos; // just after "{"
-  return sf.text.slice(start, bodyStart).trim();
-}
-
-function sliceBeforeInitializer(
-  node: ts.PropertyDeclaration,
-  sf: ts.SourceFile
-): string {
-  const start = node.getStart(sf, true);
-  if (node.initializer) {
-    const initStart = node.initializer.getStart(sf);
-    return sf.text
-      .slice(start, initStart)
-      .replace(/\=\s*$/, "")
-      .trim();
-  }
-  return node.getText(sf);
-}
-
-function ensureSemicolon(s: string): string {
-  return /[;}]$/.test(s.trim()) ? s.trim() : s.trim() + ";";
-}
-
-function indent(s: string, n = 2): string {
-  const pad = " ".repeat(n);
-  return s
-    .split(/\r?\n/)
-    .map((line) => (line ? pad + line : line))
-    .join("\n");
-}
-
-/** Replace the class name token in a header snippet with a different rendered name.
- *  Handles: "export class Foo extends Base" and "class Foo implements X".
- *  If no original name, inject the new name after "class".
- */
-function replaceClassNameInHeader(
-  header: string,
-  originalName: string | undefined,
-  newName: string
-): string {
-  if (originalName) {
-    // Replace only the first standalone occurrence of originalName after the keyword "class"
-    return header.replace(
-      new RegExp(`\\bclass\\s+${escapeRegExp(originalName)}\\b`),
-      `class ${newName}`
-    );
-  }
-  // anonymous class: insert name after "class"
-  return header.replace(/\bclass\b/, `class ${newName}`);
-}
-
-function escapeRegExp(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** Walk up from a ClassExpression to its enclosing VariableDeclaration, if any. */
-function findEnclosingVariableDeclaration(
-  node: ts.Node
-): ts.VariableDeclaration | undefined {
-  // classExpr -> VariableDeclaration.initializer
-  if (
-    node.parent &&
-    ts.isVariableDeclaration(node.parent) &&
-    node.parent.initializer === node
-  ) {
-    return node.parent;
-  }
-  return undefined;
-}
-
-function findAncestor<T extends ts.Node>(
-  n: ts.Node,
-  pred: (x: ts.Node) => x is T
-): T | undefined {
-  let cur: ts.Node | undefined = n.parent;
-  while (cur) {
-    if (pred(cur)) return cur;
-    cur = cur.parent;
-  }
-  return undefined;
-}
-
-function hasTypeAnnotation(fragment: string): boolean {
-  // crude but works for our sliced property text
-  return /:\s*[^=]+$/.test(fragment) || /:\s*[^;]+;?$/.test(fragment);
-}
-
-export function makeImportStatement(
-  exp: FoundExport,
-  opts: {
-    program: ts.Program; // the TS Program
-    packageRoot: string; // absolute path to the package root (where package.json is)
-    packageName?: string; // e.g. "my-lib" -> "my-lib/foo"
-  }
-): string {
-  const { program, packageRoot, packageName } = opts;
-
-  // Prefer re-export source (barrel) if present
-  let fromAbs = exp.moduleFile ?? exp.reexportedFrom ?? exp.declarationFile;
-
-  // Normalize helpers
-  const norm = (p: string) => p.replace(/\\/g, "/");
-  const dropExt = (p: string) => p.replace(/\.[mc]?tsx?$/i, "");
-  const dropIndex = (p: string) => p.replace(/(?:^|\/)index$/i, "");
-
-  // Determine the "source root" to cut (rootDir, or <packageRoot>/src, else packageRoot)
-  const co = program.getCompilerOptions();
-  const tryAbs = (p?: string) => (p ? path.resolve(p) : undefined);
-
-  const rootDirAbs = tryAbs(co.rootDir);
-  const pkgRootAbs = path.resolve(packageRoot);
-  const srcAbs = path.join(pkgRootAbs, "src");
-
-  let cutBase: string;
-  if (rootDirAbs && fromAbs.startsWith(rootDirAbs)) {
-    cutBase = rootDirAbs;
-  } else if (fromAbs.startsWith(srcAbs)) {
-    cutBase = srcAbs;
-  } else if (fromAbs.startsWith(pkgRootAbs)) {
-    cutBase = pkgRootAbs;
-  } else {
-    // file is outside package (rare)—fall back to dirname
-    cutBase = path.dirname(fromAbs);
-  }
-
-  // Build module specifier path (relative to cutBase)
-  let rel = norm(path.relative(cutBase, fromAbs));
-  rel = dropIndex(dropExt(rel));
-
-  let spec: string;
-  if (packageName) {
-    // Package import
-    spec = rel ? `${packageName}/${rel}` : packageName;
-  } else {
-    // Relative import
-    if (!rel || rel === "" || rel === ".") {
-      spec = "./";
-    } else {
-      spec = rel.startsWith(".") ? rel : `./${rel}`;
-    }
-  }
-
-  // Emit statement by kind
-  switch (exp.importKind) {
-    case "default":
-      return `import ${exp.exportName} from '${spec}';`;
-    case "named":
-    // export * as <name> from '...'
-    // ⟶ import { <name> } from '...'
-    case "namespace":
-      if (exp.isTypeOnly) {
-        return `import type { ${exp.exportName} } from '${spec}';`;
-      }
-      return `import { ${exp.exportName} } from '${spec}';`;
-    case "exportEquals":
-      // CommonJS style
-      return `import ${exp.exportName} = require('${spec}');`;
-    default:
-      throw new Error(`Unknown importKind: ${(exp as any).importKind}`);
-  }
-}
-
-function pruneNamespaceDuplicates(paths: AccessPath[]): AccessPath[] {
-  // If there is no non-namespace path at all, keep everything.
-  const hasNonNamespace = paths.some((p) => p.root.importKind !== "namespace");
-  if (!hasNonNamespace) return paths;
-
-  // Collect the source modules of non-namespace roots (prefer reexport origin if present)
-  const directSources = new Set(
-    paths
-      .filter((p) => p.root.importKind !== "namespace")
-      .map(
-        (p) =>
-          p.root.reexportedFrom ?? p.root.declarationFile ?? p.root.moduleFile
-      )
-  );
-
-  // Drop namespace paths that point back to a module already covered by a direct root
-  return paths.filter((p) => {
-    if (p.root.importKind !== "namespace") return true;
-    const nsSource =
-      p.root.reexportedFrom ?? p.root.declarationFile ?? p.root.moduleFile;
-    return !directSources.has(nsSource);
-  });
-}
-
-export function isClassLike(sym: ts.Symbol): boolean {
-  const d = sym.valueDeclaration ?? sym.declarations?.[0];
-  return !!d && (ts.isClassDeclaration(d) || ts.isClassExpression(d));
-}
-
-export function isFunctionLike(sym: ts.Symbol): boolean {
-  const decl = sym.valueDeclaration ?? sym.declarations?.[0];
-  return !!decl && isFunctionLikeNode(decl);
-}
-
-function isFunctionLikeNode(node: ts.Node): boolean {
-  return (
-    ts.isFunctionDeclaration(node) ||
-    ts.isMethodDeclaration(node) ||
-    ts.isFunctionExpression(node) ||
-    ts.isArrowFunction(node) ||
-    ts.isConstructorDeclaration(node) ||
-    ts.isGetAccessorDeclaration(node) ||
-    ts.isSetAccessorDeclaration(node)
-  );
-}
-
-function isTopLevelNonDeclStmt(node: ts.Node): boolean {
-  return (
-    ts.isBlock(node) ||
-    ts.isIfStatement(node) ||
-    ts.isSwitchStatement(node) ||
-    ts.isCaseClause(node) ||
-    ts.isDefaultClause(node) ||
-    ts.isTryStatement(node) ||
-    ts.isCatchClause(node) ||
-    ts.isWithStatement(node) ||
-    ts.isLabeledStatement(node) ||
-    ts.isDoStatement(node) ||
-    ts.isWhileStatement(node) ||
-    ts.isForStatement(node) ||
-    ts.isForInStatement(node) ||
-    ts.isForOfStatement(node)
-  );
-}
-
-export function isStaticMember(sym: ts.Symbol): boolean {
-  for (const d of sym.getDeclarations() ?? []) {
-    if (ts.isPropertyDeclaration(d) || ts.isMethodDeclaration(d)) {
-      return !!(ts.getCombinedModifierFlags(d) & ts.ModifierFlags.Static);
-    }
-    // JS assignment like `Chat.Completions = Completions` compiles to a
-    // property assignment on the constructor function; it shows up as a property symbol
-    // on the class's static side, so treat it as static.
-  }
-  // If no declaration info, fall back to assuming instance
-  return false;
 }

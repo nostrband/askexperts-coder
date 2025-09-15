@@ -4,11 +4,12 @@ import { Command } from "commander";
 import { debugCli, debugError, enableDebugAll } from "../utils/debug.js";
 import { TypeScript } from "../indexer/typescript/TypeScript.js";
 import { DocSymbol, symbolToDoc } from "../expert/CodeExpert.js";
+import { INDEXER_DIR } from "./index.js";
 
 /**
- * Process JSON files in the indexer_docs directory and convert to docs
+ * Process JSON files in the INDEXER_DIR directory and convert to docs
  *
- * @param packagePath - Path to the package containing indexer_docs
+ * @param packagePath - Path to the package containing INDEXER_DIR
  * @param options - Command options
  */
 async function processDocs(
@@ -36,10 +37,20 @@ async function processDocs(
       process.exit(1);
     }
 
-    const docsPath = path.join(absolutePath, "indexer_docs");
+    const docsPath = path.join(absolutePath, INDEXER_DIR);
     if (!fs.existsSync(docsPath)) {
-      debugError(`indexer_docs directory not found at: ${docsPath}`);
+      debugError(`${INDEXER_DIR} directory not found at: ${docsPath}`);
       process.exit(1);
+    }
+
+    // Read commit hash from commit.git file
+    const commitFilePath = path.join(docsPath, "commit.git");
+    let commitHash: string | undefined;
+    if (fs.existsSync(commitFilePath)) {
+      commitHash = fs.readFileSync(commitFilePath, "utf8").trim();
+      debugCli(`Found commit hash: ${commitHash}`);
+    } else {
+      debugCli("No commit.git file found, proceeding without commit hash");
     }
 
     debugCli(`Processing files for package at: ${absolutePath}`);
@@ -72,7 +83,7 @@ async function processDocs(
     let processedFiles = 0;
     let processedLines = 0;
 
-    // Recursively process all JSON files in the indexer_docs directory
+    // Recursively process all JSON files in the INDEXER_DIR directory
     const processDirectory = async (dirPath: string) => {
       const items = fs.readdirSync(dirPath);
 
@@ -98,7 +109,7 @@ async function processDocs(
             }
 
             for (const symbolInfo of symbolInfos) {
-              const doc = symbolToDoc(symbolInfo, symbolInfos, typescript);
+              const doc = symbolToDoc(symbolInfo, symbolInfos, typescript, commitHash);
 
               if (outputFilePath) {
                 // Append the line to the output file
@@ -163,9 +174,9 @@ export function registerPrepareCommand(program: Command): void {
   program
     .command("prepare")
     .description(
-      "Convert generated docs from `indexer_docs` subdir to docstore format"
+      `Convert generated docs from '${INDEXER_DIR}' subdir to docstore format`
     )
-    .argument("<package_path>", "Path to the package containing indexer_docs")
+    .argument(`<package_path>", "Path to the package containing '${INDEXER_DIR}'`)
     .option("-d, --debug", "Enable debug output")
     .option(
       "-o, --output <file>",

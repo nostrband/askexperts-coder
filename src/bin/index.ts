@@ -1,12 +1,24 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { registerGenerateCommand } from './generate.js';
 import { initializeDebug, debugCli } from '../utils/debug.js';
 import { registerSymbolsCommand } from './symbols.js';
-import { registerRagCommand, registerSearchCommand } from './rag.js';
-import { registerExpertCommand } from './expert.js';
-import { registerPrepareCommand } from './import.js';
+import { registerPrepareCommand } from './prepare.js';
+
+export const INDEXER_DIR = ".askexperts";
+
+// Get the directory of the current module
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Read version from package.json
+const packageJsonPath = join(__dirname, '../../package.json');
+const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+const version = packageJson.version;
 
 // Initialize debug
 initializeDebug();
@@ -16,16 +28,13 @@ const program = new Command();
 
 // Set up program information
 program
-  .name('askexperts-hacker')
-  .description('AI agent that analyzes TypeScript source codebases to produce searchable documentation')
-  .version('1.0.0');
+  .name('askexperts-coder')
+  .description('Convert code to RAG for AI experts')
+  .version(version);
 
 // Register commands
 registerGenerateCommand(program);
 registerSymbolsCommand(program);
-registerRagCommand(program);
-registerSearchCommand(program);
-registerExpertCommand(program);
 registerPrepareCommand(program);
 
 // Parse command line arguments and execute

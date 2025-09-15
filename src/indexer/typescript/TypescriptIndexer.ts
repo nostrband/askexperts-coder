@@ -1,6 +1,6 @@
 import { LightningPaymentManager } from "askexperts/mcp";
 import { SimplePool } from "nostr-tools";
-import { debugTypescriptHacker, debugError } from "../../utils/debug.js";
+import { debugTypescript, debugError } from "../../utils/debug.js";
 import { OpenaiAskExperts } from "askexperts/openai";
 import { ChatCompletion } from "openai/resources";
 
@@ -56,7 +56,7 @@ export class TypescriptIndexer {
     code: string,
     symbol: any
   ): Promise<any> {
-    debugTypescriptHacker(`Processing code of length: ${code.length}`);
+    debugTypescript(`Processing code of length: ${code.length}`);
 
     // Prepend line numbers to code string
     const codeLines = code
@@ -83,6 +83,7 @@ export class TypescriptIndexer {
               type: "text",
               text: codeLines,
               // NOTE: we're forcing the model to cache the code
+              // FIXME doesn't seem to work properly
               // @ts-ignore
               cache_control: {
                 type: "ephemeral",
@@ -100,14 +101,14 @@ export class TypescriptIndexer {
     if (this.maxAmount && quote.amountSats > this.maxAmount) {
       throw new Error(`Amount ${quote.amountSats} exceeds max`);
     }
-    debugTypescriptHacker(`Quote for ${quote.amountSats} sats`);
+    debugTypescript(`Quote for ${quote.amountSats} sats`);
 
     const reply = (await this.client.execute(quote.quoteId)) as ChatCompletion;
-    debugTypescriptHacker("Response usage", JSON.stringify(reply.usage));
+    debugTypescript("Response usage", JSON.stringify(reply.usage));
     const result = reply.choices[0].message.content || "";
 
     try {
-      debugTypescriptHacker(`Parsing response '${result}'`);
+      debugTypescript(`Parsing response '${result}'`);
       return JSON.parse(result);
     } catch (e) {
       debugError("Bad llm output json");
