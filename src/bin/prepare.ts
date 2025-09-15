@@ -1,10 +1,129 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { Command } from "commander";
 import { debugCli, debugError, enableDebugAll } from "../utils/debug.js";
 import { TypeScript } from "../indexer/typescript/TypeScript.js";
 import { INDEXER_DIR } from "./index.js";
 import { DocSymbol, symbolToDoc } from "../utils/docstore.js";
+import { Doc } from "askexperts/docstore";
+
+/**
+ * Read a file and validate it's UTF-8 encoded
+ * @param filePath - Path to the file to read
+ * @returns File content as string
+ * @throws Error if file cannot be read as UTF-8
+ */
+function readFileAsUtf8(filePath: string): string {
+
+  const buf = fs.readFileSync(filePath);
+
+  // quick binary test: any NUL bytes
+  if (buf.includes(0x00)) {
+    throw new Error('File looks binary (contains NUL bytes).');
+  }
+
+  // strict UTF-8 validation (throws on any invalid sequence)
+  const dec = new TextDecoder('utf-8', { fatal: true }); // fatal => throw on errors
+  return dec.decode(buf);
+}
+
+/**
+ * Create a Doc object for an always-included file
+ * @param filePath - Relative path to the file from project root
+ * @param content - File content
+ * @param commitHash - Optional commit hash
+ * @returns Doc object
+ */
+function createAlwaysIncludedDoc(filePath: string, content: string, commitHash?: string): Doc {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const id = createHash("sha256").update(`${filePath}:${content}`).digest("hex");
+  
+  let metadata = `file: ${filePath}`;
+  if (commitHash) {
+    metadata += `\ncommit: ${commitHash}`;
+  }
+
+  const doc: Doc = {
+    id,
+    docstore_id: "", // This will be set when the document is added to a docstore
+    timestamp,
+    created_at: timestamp,
+    type: "file",
+    data: content,
+    metadata,
+    embeddings: [],
+    related_ids: [],
+    include: "always"
+  };
+
+  return doc;
+}
+
+/**
+ * Process always-included files and write them as docs
+ * @param packagePath - Path to the package
+ * @param alwaysPaths - Array of file paths to always include
+ * @param commitHash - Optional commit hash
+ * @param outputFilePath - Optional output file path
+ * @param outputDirPath - Optional output directory path
+ * @returns Number of processed files
+ */
+async function processAlwaysIncludedFiles(
+  packagePath: string,
+  alwaysPaths: string[],
+  commitHash?: string,
+  outputFilePath?: string,
+  outputDirPath?: string
+): Promise<number> {
+  let processedCount = 0;
+
+  for (const relativePath of alwaysPaths) {
+    const fullPath = path.join(packagePath, relativePath);
+    
+    try {
+      if (!fs.existsSync(fullPath)) {
+        debugError(`Always-included file not found: ${fullPath}`);
+        continue;
+      }
+
+      if (!fs.statSync(fullPath).isFile()) {
+        debugError(`Always-included path is not a file: ${fullPath}`);
+        continue;
+      }
+
+      debugCli(`Processing always-included file: ${relativePath}`);
+      
+      const content = readFileAsUtf8(fullPath);
+      const doc = createAlwaysIncludedDoc(relativePath, content, commitHash);
+
+      if (outputFilePath) {
+        // Append the line to the output file
+        fs.appendFileSync(
+          outputFilePath,
+          "=========================\n" +
+            doc.metadata +
+            "\n" +
+            doc.data +
+            "\n\n"
+        );
+      }
+
+      if (outputDirPath) {
+        // Write each doc to a separate file
+        const docFilePath = path.join(outputDirPath, `${doc.id}.aedoc`);
+        fs.writeFileSync(docFilePath, JSON.stringify(doc, null, 2));
+      }
+
+      processedCount++;
+    } catch (error) {
+      debugError(`Error processing always-included file ${relativePath}: ${(error as Error).message}`);
+      throw error; // Re-throw to stop processing as requested
+    }
+  }
+
+  return processedCount;
+}
 
 /**
  * Process JSON files in the INDEXER_DIR directory and convert to docs
@@ -14,7 +133,7 @@ import { DocSymbol, symbolToDoc } from "../utils/docstore.js";
  */
 async function processDocs(
   packagePath: string,
-  options: { debug?: boolean; output?: string; dir?: string }
+  options: { debug?: boolean; output?: string; dir?: string; always?: string[] }
 ): Promise<void> {
   // Enable debug output if debug flag is set
   if (options.debug) {
@@ -78,6 +197,23 @@ async function processDocs(
     if (outputDirPath && !fs.existsSync(outputDirPath)) {
       fs.mkdirSync(outputDirPath, { recursive: true });
     }
+
+    // Handle always-included files
+    const alwaysPaths = options.always && options.always.length > 0
+      ? options.always
+      : ["package.json", "tsconfig.json", "README.md"];
+    
+    debugCli(`Processing always-included files: ${alwaysPaths.join(", ")}`);
+    
+    const alwaysProcessedCount = await processAlwaysIncludedFiles(
+      absolutePath,
+      alwaysPaths,
+      commitHash,
+      outputFilePath,
+      outputDirPath
+    );
+
+    debugCli(`Processed ${alwaysProcessedCount} always-included files`);
 
     // Track statistics
     let processedFiles = 0;
@@ -150,7 +286,7 @@ async function processDocs(
     await processDirectory(docsPath);
 
     debugCli(`Preparation complete.`);
-    debugCli(`Processed ${processedFiles} files with ${processedLines} lines.`);
+    debugCli(`Processed ${alwaysProcessedCount} always-included files and ${processedFiles} JSON files with ${processedLines} lines.`);
 
     if (outputFilePath) {
       debugCli(`Output written to file: ${outputFilePath}`);
@@ -185,6 +321,14 @@ export function registerPrepareCommand(program: Command): void {
     .option(
       "--dir <directory>",
       "Directory to write individual doc files as JSON"
+    )
+    .option(
+      "--always <path>",
+      "Sub-paths from the project to be included into the docs and marked as 'include=\"always\"' (can be specified multiple times)",
+      (value: string, previous: string[] = []) => {
+        return [...previous, value];
+      },
+      []
     )
     .action(processDocs);
 }
