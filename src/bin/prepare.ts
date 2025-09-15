@@ -133,7 +133,7 @@ async function processAlwaysIncludedFiles(
  */
 async function processDocs(
   packagePath: string,
-  options: { debug?: boolean; output?: string; dir?: string; always?: string[] }
+  options: { debug?: boolean; output?: string; dir?: string; always?: string[]; docs?: string }
 ): Promise<void> {
   // Enable debug output if debug flag is set
   if (options.debug) {
@@ -156,9 +156,16 @@ async function processDocs(
       process.exit(1);
     }
 
-    const docsPath = path.join(absolutePath, INDEXER_DIR);
+    // Determine docs path - either from --docs option or default to packagePath/INDEXER_DIR
+    const docsPath = options.docs
+      ? path.resolve(process.cwd(), options.docs)
+      : path.join(absolutePath, INDEXER_DIR);
+    
     if (!fs.existsSync(docsPath)) {
-      debugError(`${INDEXER_DIR} directory not found at: ${docsPath}`);
+      const pathDescription = options.docs
+        ? `Custom docs directory not found at: ${docsPath}`
+        : `${INDEXER_DIR} directory not found at: ${docsPath}`;
+      debugError(pathDescription);
       process.exit(1);
     }
 
@@ -329,6 +336,10 @@ export function registerPrepareCommand(program: Command): void {
         return [...previous, value];
       },
       []
+    )
+    .option(
+      "--docs <path>",
+      "Path to the docs directory (relative to current working directory). If not specified, uses <package_path>/.askexperts"
     )
     .action(processDocs);
 }
