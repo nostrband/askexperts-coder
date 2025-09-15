@@ -165,7 +165,7 @@ function validateCommitForContinue(docsPath: string, currentCommitHash: string):
  */
 async function processProject(
   projectPath: string,
-  options: { debug?: boolean; nwc?: string, name?: string, continue?: boolean, threads?: number, branch?: string }
+  options: { debug?: boolean; nwc?: string, name?: string, continue?: boolean, threads?: number, branch?: string, dir?: string }
 ): Promise<void> {
   // Enable debug output if debug flag is set
   if (options.debug) {
@@ -205,7 +205,7 @@ async function processProject(
     // Get current commit hash
     const currentCommitHash = getCurrentCommitHash(absolutePath);
     
-    const docsPath = path.join(absolutePath, INDEXER_DIR);
+    const docsPath = path.join(absolutePath, options.dir || INDEXER_DIR);
     fs.mkdirSync(docsPath, { recursive: true });
     
     // Handle commit.git file based on --continue option
@@ -292,7 +292,7 @@ If the provided input is invalid, return "ERROR: <reason>" string.
         fileContent: string;
         existingDocSymbols: Map<string, any>;
       },
-      options: { debug?: boolean; nwc?: string; name?: string; continue?: boolean; threads?: number; branch?: string }
+      options: { debug?: boolean; nwc?: string; name?: string; continue?: boolean; threads?: number; branch?: string; dir?: string }
     ): Promise<void> {
       // Check if we need to load a new file
       if (symbol.id.file !== fileCache.currentFile) {
@@ -447,5 +447,6 @@ export function registerGenerateCommand(program: Command): void {
     .option("-c, --continue", "Continue processing, skipping symbols that are already documented")
     .option("-t, --threads <number>", "Number of parallel processing threads", (value) => parseInt(value, 10), 1)
     .option("-b, --branch <string>", "Expected git branch (default: main)", "main")
+    .option("--dir <string>", `Output directory for generated docs (default: ${INDEXER_DIR})`)
     .action(processProject);
 }
