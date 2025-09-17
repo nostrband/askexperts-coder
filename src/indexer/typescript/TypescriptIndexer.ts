@@ -2,9 +2,10 @@ import { LightningPaymentManager } from "askexperts/mcp";
 import { SimplePool } from "nostr-tools";
 import { debugTypescript, debugError } from "../../utils/debug.js";
 import { OpenaiAskExperts } from "askexperts/openai";
-import { ChatCompletion } from "openai/resources";
+import { ChatCompletion, ChatCompletionCreateParams } from "openai/resources";
 
 const DEFAULT_MODEL = "anthropic/claude-3.7-sonnet";
+const DEFAULT_FALLBACK_MODEL = "anthropic/gpt-oss-120b";
 const DEFAULT_MAX_AMOUNT = 100;
 
 /**
@@ -16,6 +17,7 @@ export class TypescriptIndexer {
   private paymentManager: LightningPaymentManager;
   private ownedPool: boolean;
   private expertPubkey: string;
+  private fallbackExpertPubkey: string;
   private systemPrompt: string;
   private maxAmount?: number;
 
@@ -25,9 +27,12 @@ export class TypescriptIndexer {
     pool?: SimplePool;
     maxAmount?: number;
     expertPubkey?: string;
+    fallbackExpertPubkey?: string;
   }) {
     this.systemPrompt = options.systemPrompt;
     this.expertPubkey = options.expertPubkey || DEFAULT_MODEL;
+    this.fallbackExpertPubkey =
+      options.fallbackExpertPubkey || DEFAULT_FALLBACK_MODEL;
     this.maxAmount = options.maxAmount || DEFAULT_MAX_AMOUNT;
 
     // Create LightningPaymentManager
@@ -64,7 +69,7 @@ export class TypescriptIndexer {
       .map((line, index) => `${index + 1}|${line}`)
       .join("\n");
 
-    const quote = await this.client.getQuote(this.expertPubkey, {
+    const request: ChatCompletionCreateParams = {
       model: this.expertPubkey,
       temperature: 0.1,
       messages: [
@@ -96,7 +101,8 @@ export class TypescriptIndexer {
           ],
         },
       ],
-    });
+    };
+    const quote = await this.client.getQuote(this.expertPubkey, request);
 
     if (this.maxAmount && quote.amountSats > this.maxAmount) {
       throw new Error(`Amount ${quote.amountSats} exceeds max`);
@@ -111,8 +117,44 @@ export class TypescriptIndexer {
       debugTypescript(`Parsing response '${result}'`);
       return JSON.parse(result);
     } catch (e) {
-      debugError("Bad llm output json");
-      throw e;
+      debugError("Bad llm output json, trying fallback model");
+
+      // Try fallback model
+      try {
+        const fallbackQuote = await this.client.getQuote(
+          this.fallbackExpertPubkey,
+          { ...request, model: this.fallbackExpertPubkey }
+        );
+
+        if (this.maxAmount && fallbackQuote.amountSats > this.maxAmount) {
+          throw new Error(
+            `Fallback amount ${fallbackQuote.amountSats} exceeds max`
+          );
+        }
+        debugTypescript(`Fallback quote for ${fallbackQuote.amountSats} sats`);
+
+        const fallbackReply = (await this.client.execute(
+          fallbackQuote.quoteId
+        )) as ChatCompletion;
+        debugTypescript(
+          "Fallback response usage",
+          JSON.stringify(fallbackReply.usage)
+        );
+        const fallbackResult = fallbackReply.choices[0].message.content || "";
+
+        try {
+          debugTypescript(`Parsing fallback response '${fallbackResult}'`);
+          return JSON.parse(fallbackResult);
+        } catch (fallbackError) {
+          debugError("Fallback model also returned invalid JSON");
+          throw new Error(
+            "Both primary and fallback models returned invalid JSON"
+          );
+        }
+      } catch (fallbackError) {
+        debugError("Fallback model request failed", fallbackError);
+        throw fallbackError;
+      }
     }
   }
 
