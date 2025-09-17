@@ -5,7 +5,7 @@ import { OpenaiAskExperts } from "askexperts/openai";
 import { ChatCompletion, ChatCompletionCreateParams } from "openai/resources";
 
 const DEFAULT_MODEL = "anthropic/claude-3.7-sonnet";
-const DEFAULT_FALLBACK_MODEL = "anthropic/gpt-oss-120b";
+const DEFAULT_FALLBACK_MODEL = "openai/gpt-oss-120b";
 const DEFAULT_MAX_AMOUNT = 100;
 
 /**
