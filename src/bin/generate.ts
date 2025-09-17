@@ -57,6 +57,7 @@ export function saveNwcString(nwcString: string): void {
 
 /**
  * Check git status and ensure we're on the expected branch with a clean tree
+ * Ignores changes in INDEXER_DIR to allow --continue option to work
  *
  * @param projectPath - Path to the project to check
  * @param expectedBranch - Expected git branch (default: main)
@@ -72,7 +73,24 @@ function checkGitStatus(projectPath: string, expectedBranch: string = "main"): v
     }).trim();
     
     if (gitStatus) {
-      throw new Error(`Git tree is not clean. Please commit or stash your changes first.\nUncommitted changes:\n${gitStatus}`);
+      // Filter out changes in INDEXER_DIR (.askexperts) to allow --continue option
+      const filteredStatus = gitStatus
+        .split('\n')
+        .filter(line => {
+          // Extract the file path from git status line (format: "XY filename")
+          const filePath = line.slice(3); // Remove the first 3 characters (status + space)
+          return !filePath.startsWith(INDEXER_DIR + '/') && filePath !== INDEXER_DIR;
+        })
+        .join('\n')
+        .trim();
+      
+      if (filteredStatus) {
+        throw new Error(`Git tree is not clean. Please commit or stash your changes first.\nUncommitted changes:\n${filteredStatus}`);
+      }
+      
+      if (gitStatus !== filteredStatus) {
+        debugCli(`Ignoring changes in ${INDEXER_DIR} directory for --continue compatibility`);
+      }
     }
     
     // Check current branch
