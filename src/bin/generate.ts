@@ -7,6 +7,7 @@ import { debugCli, debugError, enableDebugAll } from "../utils/debug.js";
 import { StableSymbolId, Symbol, TypeScript } from "../indexer/typescript/TypeScript.js";
 import { TypescriptIndexer } from "../indexer/typescript/TypescriptIndexer.js";
 import { INDEXER_DIR } from "./index.js";
+import { extractWorkspaces } from "../utils/workspace.js";
 
 const NWC_FILE = ".askexperts-coder.nwc";
 
@@ -223,54 +224,95 @@ async function processProject(
     // Get current commit hash
     const currentCommitHash = getCurrentCommitHash(absolutePath);
     
-    const docsPath = options.dir
-      ? path.resolve(process.cwd(), options.dir)
-      : path.join(absolutePath, INDEXER_DIR);
-    fs.mkdirSync(docsPath, { recursive: true });
+    // Check if this is a monorepo with workspaces
+    const workspaces = extractWorkspaces(absolutePath);
     
-    // Handle commit.git file based on --continue option
-    if (options.continue) {
-      validateCommitForContinue(docsPath, currentCommitHash);
+    if (workspaces.length > 0) {
+      debugCli(`Found ${workspaces.length} workspaces in monorepo`);
+      // Process each workspace
+      for (const workspace of workspaces) {
+        debugCli(`Processing workspace: ${workspace.name || workspace.path}`);
+        await processWorkspace(workspace.path, absolutePath, currentCommitHash, nwcString, options);
+      }
     } else {
-      writeCommitFile(docsPath, currentCommitHash);
+      // Process as a single package
+      debugCli(`Processing as single package`);
+      await processWorkspace(absolutePath, absolutePath, currentCommitHash, nwcString, options);
     }
 
-    debugCli(`Loading project...`);
+  } catch (error) {
+    debugError(`Error processing project: ${(error as Error).message}`);
+    process.exit(1);
+  }
+}
 
-    const project = new TypeScript(absolutePath);
-    const symbols = project.listAllSymbols();
-    debugCli(`Project has ${symbols.length} root symbols`);
+/**
+ * Process a single workspace
+ *
+ * @param workspacePath - Path to the workspace to process
+ * @param rootProjectPath - Path to the root project (for relative paths)
+ * @param currentCommitHash - Current git commit hash
+ * @param nwcString - NWC string for payments
+ * @param options - Command options
+ */
+async function processWorkspace(
+  workspacePath: string,
+  rootProjectPath: string,
+  currentCommitHash: string,
+  nwcString: string,
+  options: { debug?: boolean; nwc?: string, name?: string, continue?: boolean, threads?: number, branch?: string, dir?: string, maxAmount?: number }
+): Promise<void> {
+  const workspaceRelativePath = path.relative(rootProjectPath, workspacePath);
+  const workspacePrefix = workspaceRelativePath ? workspaceRelativePath + "/" : "";
+  
+  debugCli(`Processing workspace at: ${workspacePath}`);
+  
+  // Create INDEXER_DIR within each workspace, not under the root
+  const docsPath = options.dir
+    ? path.resolve(process.cwd(), options.dir)
+    : path.join(workspacePath, INDEXER_DIR);
+  fs.mkdirSync(docsPath, { recursive: true });
+  
+  // Handle commit.git file based on --continue option
+  if (options.continue) {
+    validateCommitForContinue(docsPath, currentCommitHash);
+  } else {
+    writeCommitFile(docsPath, currentCommitHash);
+  }
 
-    const symbolInfos: (Symbol & { parentId?: StableSymbolId })[] = [];
-    const addInfo = (s: Symbol) => {
-      symbolInfos.push({
-        ...s,
-        parentId: s.parent?.id,
+  debugCli(`Loading workspace project...`);
 
-        // not needed, and can't be stringified
-        children: undefined,
-        parent: undefined,
-      });
-    };
+  const project = new TypeScript(workspacePath);
+  const symbols = project.listAllSymbols();
+  debugCli(`Workspace has ${symbols.length} root symbols`);
 
-    const addSymbols = (ss: Symbol[]) => {
-      for (const s of ss) {
-        addInfo(s);
-        if (s.children) addSymbols(s.children);
-      }
-    };
+  const symbolInfos: (Symbol & { parentId?: StableSymbolId })[] = [];
+  const addInfo = (s: Symbol) => {
+    // Don't modify the symbol ID - keep the original file path
+    // The workspace prefix will be handled in the output file path only
+    symbolInfos.push({
+      ...s,
+      parentId: s.parent?.id,
 
-    addSymbols(symbols);
+      // not needed, and can't be stringified
+      children: undefined,
+      parent: undefined,
+    });
+  };
 
-    // Sort by filename
-    // symbolInfos.sort((a, b) =>
-    //   a.file < b.file ? -1 : a.file > b.file ? 1 : 0
-    // );
+  const addSymbols = (ss: Symbol[]) => {
+    for (const s of ss) {
+      addInfo(s);
+      if (s.children) addSymbols(s.children);
+    }
+  };
 
-    const indexer = new TypescriptIndexer({
-      nwc: nwcString,
-      maxAmount: options.maxAmount,
-      systemPrompt: `
+  addSymbols(symbols);
+
+  const indexer = new TypescriptIndexer({
+    nwc: nwcString,
+    maxAmount: options.maxAmount,
+    systemPrompt: `
 You are a TypeScript expert, your task is to create documentation for every symbol in a typescript project.
 
 User will provide:
@@ -290,7 +332,7 @@ details contain numbered lists.
 
 If the provided input is invalid, return "ERROR: <reason>" string.
 `
-    });
+  });
 
     /**
      * Process a single symbol asynchronously
@@ -318,6 +360,7 @@ If the provided input is invalid, return "ERROR: <reason>" string.
       // Check if we need to load a new file
       if (symbol.id.file !== fileCache.currentFile) {
         fileCache.currentFile = symbol.id.file;
+        // The symbol.id.file is already relative to the workspace, so use it directly
         fileCache.fileContent = fs
           .readFileSync(path.join(projectPath, symbol.id.file))
           .toString("utf8");
@@ -368,6 +411,7 @@ If the provided input is invalid, return "ERROR: <reason>" string.
         ...docs
       };
 
+      // Since each workspace has its own INDEXER_DIR, no need for workspace prefix
       const docsFile = path.join(docsPath, symbol.id.file + ".json");
       
       // Ensure the directory structure exists before writing
@@ -379,76 +423,71 @@ If the provided input is invalid, return "ERROR: <reason>" string.
       fs.appendFileSync(docsFile, JSON.stringify(info) + "\n");
     }
 
-    // Initialize the file cache
-    const fileCache = {
-      currentFile: "",
-      fileContent: "",
-      existingDocSymbols: new Map<string, any>()
-    };
+  // Initialize the file cache
+  const fileCache = {
+    currentFile: "",
+    fileContent: "",
+    existingDocSymbols: new Map<string, any>()
+  };
+  
+  // Get the number of threads (default to 1 if not specified)
+  const numThreads = options.threads || 1;
+  debugCli(`Processing with ${numThreads} parallel threads`);
+  
+  // Process symbols in parallel
+  const activePromises: Promise<void>[] = [];
+  let nextSymbolIndex = 0;
+  
+  // Helper function to process the next symbol
+  const processNextSymbol = () => {
+    if (nextSymbolIndex >= symbolInfos.length) throw new Error("No more symbols");
     
-    // Get the number of threads (default to 1 if not specified)
-    const numThreads = options.threads || 1;
-    debugCli(`Processing with ${numThreads} parallel threads`);
+    const symbol = symbolInfos[nextSymbolIndex];
+    nextSymbolIndex++;
     
-    // Process symbols in parallel
-    const activePromises: Promise<void>[] = [];
-    let nextSymbolIndex = 0;
-    
-    // Helper function to process the next symbol
-    const processNextSymbol = () => {
-      if (nextSymbolIndex >= symbolInfos.length) throw new Error("No more symbols");
-      
-      const symbol = symbolInfos[nextSymbolIndex];
-      nextSymbolIndex++;
-      
-      return processSymbolAsync(symbol, absolutePath, docsPath, indexer, fileCache, options)
-        .catch(error => {
-          debugError(`Error processing symbol ${symbol.id.name}: ${error.message}`);
-          // Re-throw to ensure Promise.race catches it
-          throw error;
-        });
-    };
-    
-    // Initial filling of the active promises array
-    while (activePromises.length < numThreads && nextSymbolIndex < symbolInfos.length) {
-      const promise = processNextSymbol();
-      activePromises.push(promise);
-    }
-    
-    // Process remaining symbols as active ones complete
-    while (activePromises.length > 0) {
-      try {
-        // Create a promise that resolves with the index of the completed promise
-        const racePromises = activePromises.map(async (p, index) => {
-          await p;
-          return index;
-        });
-        
-        // Wait for the first promise to complete
-        const completedIndex = await Promise.race(racePromises);
-        
-        // Remove the completed promise from the active array
-        if (completedIndex !== undefined) {
-          activePromises.splice(completedIndex, 1);
-        }
-        
-        // Add a new promise if there are more symbols to process
-        if (nextSymbolIndex < symbolInfos.length) {
-          const newPromise = processNextSymbol();
-          activePromises.push(newPromise);
-        } else {
-          debugCli("No more symbols");
-        }
-      } catch (error) {
-        debugError(`Error in parallel processing: ${(error as Error).message}`);
-        // stop
+    return processSymbolAsync(symbol, workspacePath, docsPath, indexer, fileCache, options)
+      .catch(error => {
+        debugError(`Error processing symbol ${symbol.id.name}: ${error.message}`);
+        // Re-throw to ensure Promise.race catches it
         throw error;
+      });
+  };
+  
+  // Initial filling of the active promises array
+  while (activePromises.length < numThreads && nextSymbolIndex < symbolInfos.length) {
+    const promise = processNextSymbol();
+    activePromises.push(promise);
+  }
+  
+  // Process remaining symbols as active ones complete
+  while (activePromises.length > 0) {
+    try {
+      // Create a promise that resolves with the index of the completed promise
+      const racePromises = activePromises.map(async (p, index) => {
+        await p;
+        return index;
+      });
+      
+      // Wait for the first promise to complete
+      const completedIndex = await Promise.race(racePromises);
+      
+      // Remove the completed promise from the active array
+      if (completedIndex !== undefined) {
+        activePromises.splice(completedIndex, 1);
       }
+      
+      // Add a new promise if there are more symbols to process
+      if (nextSymbolIndex < symbolInfos.length) {
+        const newPromise = processNextSymbol();
+        activePromises.push(newPromise);
+      } else {
+        debugCli("No more symbols");
+      }
+    } catch (error) {
+      debugError(`Error in parallel processing: ${(error as Error).message}`);
+      // stop
+      throw error;
     }
-
-  } catch (error) {
-    debugError(`Error processing project: ${(error as Error).message}`);
-    process.exit(1);
   }
 }
 

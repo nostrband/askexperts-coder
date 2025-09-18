@@ -816,6 +816,8 @@ export function resolveStableId(
         ts.isMethodDeclaration(n) ||
         ts.isMethodSignature(n) ||
         ts.isConstructorDeclaration(n) ||
+        ts.isCallSignatureDeclaration(n) ||
+        ts.isConstructSignatureDeclaration(n) ||
         ts.isGetAccessorDeclaration(n) ||
         ts.isSetAccessorDeclaration(n) ||
         ts.isPropertyDeclaration(n) ||
@@ -846,6 +848,8 @@ export function resolveStableId(
           ts.isFunctionDeclaration(n) ||
           ts.isMethodDeclaration(n) ||
           ts.isConstructorDeclaration(n) ||
+          ts.isCallSignatureDeclaration(n) ||
+          ts.isConstructSignatureDeclaration(n) ||
           ts.isGetAccessorDeclaration(n) ||
           ts.isSetAccessorDeclaration(n) ||
           ts.isPropertyDeclaration(n) ||
