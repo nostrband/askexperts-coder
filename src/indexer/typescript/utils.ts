@@ -824,7 +824,8 @@ export function resolveStableId(
         ts.isPropertyAssignment(n) ||
         ts.isShorthandPropertyAssignment(n) ||
         ts.isEnumMember(n) ||
-        ts.isVariableDeclaration(n)
+        ts.isVariableDeclaration(n) ||
+        ts.isModuleDeclaration(n)
       )
         considerDecl(n as ts.Declaration);
       ts.forEachChild(n, visit);
@@ -852,7 +853,8 @@ export function resolveStableId(
           ts.isPropertyAssignment(n) ||
           ts.isShorthandPropertyAssignment(n) ||
           ts.isEnumMember(n) ||
-          ts.isVariableDeclaration(n)
+          ts.isVariableDeclaration(n) ||
+          ts.isModuleDeclaration(n)
         )
           considerDecl(n as ts.Declaration);
         ts.forEachChild(n, visit);
