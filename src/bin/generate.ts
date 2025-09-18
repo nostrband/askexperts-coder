@@ -265,6 +265,13 @@ async function processWorkspace(
   const workspaceRelativePath = path.relative(rootProjectPath, workspacePath);
   const workspacePrefix = workspaceRelativePath ? workspaceRelativePath + "/" : "";
   
+  // Check if tsconfig.json exists in the workspace
+  const tsconfigPath = path.join(workspacePath, 'tsconfig.json');
+  if (!fs.existsSync(tsconfigPath)) {
+    debugCli(`Skipping workspace ${workspacePath}: no tsconfig.json found`);
+    return;
+  }
+  
   debugCli(`Processing workspace at: ${workspacePath}`);
   
   // Create INDEXER_DIR within each workspace, not under the root
