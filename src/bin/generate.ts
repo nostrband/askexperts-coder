@@ -74,13 +74,20 @@ function checkGitStatus(projectPath: string, expectedBranch: string = "main"): v
     }).trim();
     
     if (gitStatus) {
-      // Filter out changes in INDEXER_DIR (.askexperts) to allow --continue option
+      // Filter out changes in INDEXER_DIR (.askexperts) in any workspace to allow --continue option
       const filteredStatus = gitStatus
         .split('\n')
         .filter(line => {
           // Extract the file path from git status line (format: "XY filename")
           const filePath = line.slice(3); // Remove the first 3 characters (status + space)
-          return !filePath.startsWith(INDEXER_DIR + '/') && filePath !== INDEXER_DIR;
+          
+          // Check if this is an INDEXER_DIR path in any location
+          const pathParts = filePath.split('/');
+          const isIndexerDir = pathParts.some(part => part === INDEXER_DIR) ||
+                              filePath === INDEXER_DIR ||
+                              filePath.startsWith(INDEXER_DIR + '/');
+          
+          return !isIndexerDir;
         })
         .join('\n')
         .trim();
@@ -90,7 +97,7 @@ function checkGitStatus(projectPath: string, expectedBranch: string = "main"): v
       }
       
       if (gitStatus !== filteredStatus) {
-        debugCli(`Ignoring changes in ${INDEXER_DIR} directory for --continue compatibility`);
+        debugCli(`Ignoring changes in ${INDEXER_DIR} directories for --continue compatibility`);
       }
     }
     

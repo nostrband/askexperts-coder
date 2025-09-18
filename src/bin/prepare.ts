@@ -121,8 +121,9 @@ async function processAlwaysIncludedFiles(
       }
 
       if (outputDirPath) {
-        // Write each doc to a separate file
-        const docFilePath = path.join(outputDirPath, `${doc.id}.aedoc`);
+        // Write each doc to a separate file using hash of doc.id for filename
+        const fileNameHash = createHash("sha256").update(doc.id).digest("hex");
+        const docFilePath = path.join(outputDirPath, `${fileNameHash}.aedoc`);
         fs.writeFileSync(docFilePath, JSON.stringify(doc, null, 2));
       }
 
@@ -483,8 +484,9 @@ async function processWorkspace(
   }
 
   if (outputDirPath) {
-    // Write the project files doc to a separate file
-    const docFilePath = path.join(outputDirPath, `${projectFilesDoc.id.replace(/[\/\\:]/g, '_')}.aedoc`);
+    // Write the project files doc to a separate file using hash of doc.id for filename
+    const fileNameHash = createHash("sha256").update(projectFilesDoc.id).digest("hex");
+    const docFilePath = path.join(outputDirPath, `${fileNameHash}.aedoc`);
     fs.writeFileSync(docFilePath, JSON.stringify(projectFilesDoc, null, 2));
   }
 
@@ -541,8 +543,9 @@ async function processWorkspace(
             }
 
             if (outputDirPath) {
-              // Write each doc to a separate file
-              const docFilePath = path.join(outputDirPath, `${doc.id.replace(/[\/\\:]/g, '_')}.aedoc`);
+              // Write each doc to a separate file using hash of doc.id for filename
+              const fileNameHash = createHash("sha256").update(doc.id).digest("hex");
+              const docFilePath = path.join(outputDirPath, `${fileNameHash}.aedoc`);
               fs.writeFileSync(docFilePath, JSON.stringify(doc, null, 2));
             }
 
