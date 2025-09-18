@@ -126,6 +126,152 @@ async function processAlwaysIncludedFiles(
 }
 
 /**
+ * Parse .gitignore file and return patterns
+ * @param gitignorePath - Path to .gitignore file
+ * @returns Array of gitignore patterns
+ */
+function parseGitignore(gitignorePath: string): string[] {
+  if (!fs.existsSync(gitignorePath)) {
+    return [];
+  }
+  
+  const content = fs.readFileSync(gitignorePath, 'utf8');
+  return content
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line && !line.startsWith('#'));
+}
+
+/**
+ * Check if a file path should be ignored based on gitignore patterns
+ * @param filePath - Relative file path from project root
+ * @param patterns - Array of gitignore patterns
+ * @returns True if file should be ignored
+ */
+function shouldIgnoreFile(filePath: string, patterns: string[]): boolean {
+  // Always ignore these directories
+  const alwaysIgnore = ['node_modules', '.askexperts', '.git'];
+  
+  for (const ignore of alwaysIgnore) {
+    if (filePath.includes(ignore)) {
+      return true;
+    }
+  }
+  
+  // Check gitignore patterns
+  for (const pattern of patterns) {
+    // Simple pattern matching - handle basic cases
+    if (pattern.endsWith('/')) {
+      // Directory pattern
+      const dirPattern = pattern.slice(0, -1);
+      if (filePath.startsWith(dirPattern + '/') || filePath === dirPattern) {
+        return true;
+      }
+    } else if (pattern.includes('*')) {
+      // Wildcard pattern - basic implementation
+      const regex = new RegExp(pattern.replace(/\*/g, '.*'));
+      if (regex.test(filePath)) {
+        return true;
+      }
+    } else {
+      // Exact match
+      if (filePath === pattern || filePath.startsWith(pattern + '/')) {
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * Generate a file tree string with |- formatting
+ * @param dirPath - Directory path to scan
+ * @param gitignorePatterns - Array of gitignore patterns
+ * @param prefix - Current prefix for tree formatting
+ * @param isLast - Whether this is the last item in current level
+ * @param relativePath - Relative path from project root
+ * @returns Tree string representation
+ */
+function generateFileTree(
+  dirPath: string,
+  gitignorePatterns: string[],
+  prefix: string = '',
+  isLast: boolean = true,
+  relativePath: string = ''
+): string {
+  let result = '';
+  
+  try {
+    const items = fs.readdirSync(dirPath, { withFileTypes: true })
+      .filter(item => {
+        const itemRelativePath = relativePath ? `${relativePath}/${item.name}` : item.name;
+        return !shouldIgnoreFile(itemRelativePath, gitignorePatterns);
+      })
+      .sort((a, b) => {
+        // Directories first, then files, both alphabetically
+        if (a.isDirectory() && !b.isDirectory()) return -1;
+        if (!a.isDirectory() && b.isDirectory()) return 1;
+        return a.name.localeCompare(b.name);
+      });
+
+    items.forEach((item, index) => {
+      const isLastItem = index === items.length - 1;
+      const connector = isLastItem ? '└── ' : '├── ';
+      const itemRelativePath = relativePath ? `${relativePath}/${item.name}` : item.name;
+      
+      result += `${prefix}${connector}${item.name}\n`;
+      
+      if (item.isDirectory()) {
+        const newPrefix = prefix + (isLastItem ? '    ' : '│   ');
+        const itemPath = path.join(dirPath, item.name);
+        result += generateFileTree(itemPath, gitignorePatterns, newPrefix, isLastItem, itemRelativePath);
+      }
+    });
+  } catch (error) {
+    debugError(`Error reading directory ${dirPath}: ${(error as Error).message}`);
+  }
+  
+  return result;
+}
+
+/**
+ * Create a synthetic document containing the project file tree
+ * @param packagePath - Path to the package root
+ * @returns Doc object for the project files
+ */
+function createProjectFilesDoc(packagePath: string): Doc {
+  const timestamp = Math.floor(Date.now() / 1000);
+  
+  // Parse gitignore
+  const gitignorePath = path.join(packagePath, '.gitignore');
+  const gitignorePatterns = parseGitignore(gitignorePath);
+  
+  // Generate file tree
+  const projectName = path.basename(packagePath);
+  let fileTree = `${projectName}/\n`;
+  fileTree += generateFileTree(packagePath, gitignorePatterns);
+  
+  // Create document ID
+  const id = `${packagePath}:project-files`;
+  
+  const doc: Doc = {
+    id,
+    docstore_id: "", // This will be set when the document is added to a docstore
+    timestamp,
+    created_at: timestamp,
+    type: "project_files",
+    data: fileTree,
+    metadata: "project files",
+    embeddings: [],
+    related_ids: [],
+    include: "always"
+  };
+  
+  return doc;
+}
+
+/**
  * Process JSON files in the INDEXER_DIR directory and convert to docs
  *
  * @param packagePath - Path to the package containing INDEXER_DIR
@@ -221,6 +367,30 @@ async function processDocs(
     );
 
     debugCli(`Processed ${alwaysProcessedCount} always-included files`);
+
+    // Create and process the synthetic project files document
+    debugCli(`Creating synthetic project files document`);
+    const projectFilesDoc = createProjectFilesDoc(absolutePath);
+    
+    if (outputFilePath) {
+      // Append the project files doc to the output file
+      fs.appendFileSync(
+        outputFilePath,
+        "=========================\n" +
+          projectFilesDoc.metadata +
+          "\n" +
+          projectFilesDoc.data +
+          "\n\n"
+      );
+    }
+
+    if (outputDirPath) {
+      // Write the project files doc to a separate file
+      const docFilePath = path.join(outputDirPath, `${projectFilesDoc.id.replace(/[\/\\:]/g, '_')}.aedoc`);
+      fs.writeFileSync(docFilePath, JSON.stringify(projectFilesDoc, null, 2));
+    }
+
+    debugCli(`Created synthetic project files document`);
 
     // Track statistics
     let processedFiles = 0;
