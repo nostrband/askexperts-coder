@@ -243,8 +243,12 @@ export function findClassDecl(
   const sf = program.getSourceFile(path.resolve(absFilePath));
   if (!sf) return;
   let out: ts.ClassDeclaration | undefined;
+  const visited = new Set<ts.Node>();
 
   sf.forEachChild(function walk(node) {
+    if (visited.has(node)) return;
+    visited.add(node);
+    
     if (ts.isClassDeclaration(node) && node.name?.text === className) {
       out = node;
     }
@@ -273,8 +277,11 @@ export function findClassMethodDecl(
   if (!sf) return;
 
   let found: ts.MethodDeclaration | undefined;
+  const visited = new Set<ts.Node>();
 
   const visit = (node: ts.Node) => {
+    if (visited.has(node)) return;
+    visited.add(node);
     // Case 1: class declaration (named or default)
     if (ts.isClassDeclaration(node)) {
       const matchesName = className ? node.name?.text === className : true;
@@ -356,8 +363,12 @@ export function findFunctionDecl(
   const sf = program.getSourceFile(path.resolve(absFilePath));
   if (!sf) return;
   let out: ts.FunctionDeclaration | undefined;
+  const visited = new Set<ts.Node>();
 
   sf.forEachChild(function walk(node) {
+    if (visited.has(node)) return;
+    visited.add(node);
+    
     if (ts.isFunctionDeclaration(node) && node.name?.text === fnName) {
       out = node;
     }
@@ -380,8 +391,12 @@ export function findVariableDecl(
   const sf = program.getSourceFile(path.resolve(absFilePath));
   if (!sf) return;
   let out: ts.VariableDeclaration | undefined;
+  const visited = new Set<ts.Node>();
 
   sf.forEachChild(function walk(node) {
+    if (visited.has(node)) return;
+    visited.add(node);
+    
     if (ts.isVariableStatement(node)) {
       for (const decl of node.declarationList.declarations) {
         if (ts.isIdentifier(decl.name) && decl.name.text === varName) {
@@ -408,8 +423,12 @@ export function findInterfaceDecl(
   const sf = program.getSourceFile(path.resolve(absFilePath));
   if (!sf) return;
   let out: ts.InterfaceDeclaration | undefined;
+  const visited = new Set<ts.Node>();
 
   sf.forEachChild(function walk(node) {
+    if (visited.has(node)) return;
+    visited.add(node);
+    
     if (ts.isInterfaceDeclaration(node) && node.name.text === ifaceName) {
       out = node;
     }
@@ -805,7 +824,11 @@ export function resolveStableId(
 
   if (file) {
     // fast path: search only in that file
+    const visited = new Set<ts.Node>();
     const visit = (n: ts.Node) => {
+      if (visited.has(n)) return;
+      visited.add(n);
+      
       // cheap filter by kind & name
       if (
         ts.isClassDeclaration(n) ||
@@ -839,7 +862,11 @@ export function resolveStableId(
   if (!candidates.length) {
     for (const sf of program.getSourceFiles()) {
       if (sf.isDeclarationFile) continue;
+      const visited = new Set<ts.Node>();
       const visit = (n: ts.Node) => {
+        if (visited.has(n)) return;
+        visited.add(n);
+        
         if (
           ts.isClassDeclaration(n) ||
           ts.isInterfaceDeclaration(n) ||

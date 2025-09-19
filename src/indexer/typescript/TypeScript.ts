@@ -187,6 +187,7 @@ export class TypeScript {
   private options: ts.CompilerOptions;
   private allRoots: FoundExport[];
   private valueRoots: FoundExport[];
+  private relatedCallStack?: Set<string>;
 
   // Class field you can flip at runtime
   private debug = false;
@@ -570,6 +571,7 @@ export class TypeScript {
    */
   private typeTargets(t: ts.Type): ts.Symbol[] {
     const seenDecl = new Set<ts.Declaration>();
+    const visitedTypes = new Set<ts.Type>();
     const out: ts.Symbol[] = [];
 
     const pushSym = (s?: ts.Symbol) => {
@@ -582,6 +584,12 @@ export class TypeScript {
     };
 
     const visit = (ty: ts.Type) => {
+      // Prevent infinite recursion by tracking visited types
+      if (visitedTypes.has(ty)) {
+        return;
+      }
+      visitedTypes.add(ty);
+      
       // Prefer alias name when present
       const aliasSym = (ty as any).aliasSymbol as ts.Symbol | undefined;
       if (aliasSym) pushSym(aliasSym);
@@ -655,6 +663,7 @@ export class TypeScript {
   private symbolsFromTypeNodeDeep(node: ts.TypeNode): ts.Symbol[] {
     const out: ts.Symbol[] = [];
     const seenDecl = new Set<ts.Declaration>();
+    const visitedNodes = new Set<ts.Node>();
 
     const addSym = (s?: ts.Symbol) => {
       if (!s) return;
@@ -666,6 +675,12 @@ export class TypeScript {
     };
 
     const visit = (n: ts.Node) => {
+      // Prevent infinite recursion by tracking visited nodes
+      if (visitedNodes.has(n)) {
+        return;
+      }
+      visitedNodes.add(n);
+      
       // Recurse into child nodes by kind
       if (ts.isTypeReferenceNode(n)) {
         // Collect the referenced name (e.g., SubscriptionParams, EventTemplate, Promise, Omit)
@@ -763,7 +778,12 @@ export class TypeScript {
       }
 
       // default: drill into children
-      ts.forEachChild(n, visit);
+      ts.forEachChild(n, (child) => {
+        if (!visitedNodes.has(child)) {
+          visit(child);
+        }
+      });
+      
     };
 
     visit(node);
@@ -1199,7 +1219,15 @@ export class TypeScript {
       if (relativePath.startsWith("..") || path.isAbsolute(relativePath))
         continue;
 
+      // Add cycle detection to prevent infinite recursion
+      const visitedNodes = new Set<ts.Node>();
+      
       const visit = (node: ts.Node, parent?: ts.Node) => {
+        // Prevent infinite recursion by tracking visited nodes
+        if (visitedNodes.has(node)) {
+          return;
+        }
+        visitedNodes.add(node);
         if (ts.isFunctionDeclaration(node) && node.name) {
           addRow(node.name, node, parent);
         } else if (ts.isClassDeclaration(node) && node.name) {
@@ -1338,8 +1366,14 @@ export class TypeScript {
               ts.isModuleBlock(node.body))
           )
         ) {
-          ts.forEachChild(node, (child) => visit(child, node));
+          ts.forEachChild(node, (child) => {
+            // Only visit if we haven't seen this child before
+            if (!visitedNodes.has(child)) {
+              visit(child, node);
+            }
+          });
         }
+        
       };
 
       // Start with no parent for top-level declarations
@@ -1478,6 +1512,11 @@ export class TypeScript {
    * Returns unique items by declaration identity with source location hints.
    */
   public related(target: ts.Symbol | ts.Declaration): RelatedItem[] {
+    // Add recursion tracking for the related method
+    if (!this.relatedCallStack) {
+      this.relatedCallStack = new Set<string>();
+    }
+    
     // If target is already a declaration, use it directly; otherwise get symbol and its first declaration
     let decl: ts.Declaration;
     let sym: ts.Symbol;
@@ -1495,6 +1534,17 @@ export class TypeScript {
       if (!resolvedSym) return [];
       sym = resolvedSym;
     }
+    
+    // Create a unique key for this declaration to detect cycles
+    const sf = decl.getSourceFile();
+    const declKey = `${sf.fileName}:${decl.getStart(sf)}:${ts.SyntaxKind[decl.kind]}`;
+    
+    if (this.relatedCallStack.has(declKey)) {
+      console.log(`[RELATED] Circular reference detected for: ${declKey}`);
+      return []; // Return empty to break the cycle
+    }
+    
+    this.relatedCallStack.add(declKey);
 
     const addSet = new Map<ts.Declaration, RelatedItem>();
     const add = (s: ts.Symbol) => {
@@ -1823,7 +1873,9 @@ export class TypeScript {
       const t = this.checker.getTypeOfSymbolAtLocation(sym, decl);
       this.typeTargets(t).forEach(add);
       addContainerIfAny();
-      return [...addSet.values()];
+      const result = [...addSet.values()];
+      this.relatedCallStack.delete(declKey);
+      return result;
     }
   }
 
@@ -2025,6 +2077,10 @@ export class TypeScript {
   private symbolsFromValueExprDeep(expr: ts.Expression): ts.Symbol[] {
     const out: ts.Symbol[] = [];
     const seen = new Set<ts.Declaration>();
+    const visitedNodes = new Set<ts.Node>();
+    let recursionDepth = 0;
+    const MAX_RECURSION_DEPTH = 500;
+    
     const push = (label: string, s?: ts.Symbol) => {
       if (!s) {
         this.dbg("push:", label, "<no symbol>");
@@ -2049,6 +2105,24 @@ export class TypeScript {
     };
 
     const visit = (e: ts.Expression) => {
+      recursionDepth++;
+      
+      if (recursionDepth > MAX_RECURSION_DEPTH) {
+        console.error(`symbolsFromValueExprDeep: Maximum recursion depth exceeded at ${recursionDepth}. Node kind: ${ts.SyntaxKind[e.kind]}`);
+        throw new Error(`Stack overflow prevented in symbolsFromValueExprDeep at depth ${recursionDepth}`);
+      }
+      
+      // Prevent infinite recursion by tracking visited nodes
+      if (visitedNodes.has(e)) {
+        recursionDepth--;
+        return;
+      }
+      visitedNodes.add(e);
+      
+      if (recursionDepth % 50 === 0) {
+        console.log(`symbolsFromValueExprDeep depth: ${recursionDepth}, Node: ${ts.SyntaxKind[e.kind]}`);
+      }
+      
       this.dbg("visit:", this.nodeInfo(e));
 
       // unwrap
@@ -2185,8 +2259,11 @@ export class TypeScript {
       }
 
       ts.forEachChild(e, (c) => {
-        if (ts.isExpression(c)) visit(c);
+        if (ts.isExpression(c) && !visitedNodes.has(c)) {
+          visit(c);
+        }
       });
+      
     };
 
     visit(expr);

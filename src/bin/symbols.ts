@@ -36,7 +36,16 @@ function listAllSymbolsForWorkspace(workspacePath: string, rootProjectPath: stri
   const workspaceRelativePath = path.relative(rootProjectPath, workspacePath);
   const workspacePrefix = workspaceRelativePath ? workspaceRelativePath + "/" : "";
   
+  const printedSymbols = new Set<string>();
   const print = (s: Symbol, offset: number = 0) => {
+    // Prevent infinite recursion by tracking printed symbols
+    const symbolKey = `${s.id.file}:${s.id.name}:${s.id.kind}:${s.id.overloadIndex}`;
+    if (printedSymbols.has(symbolKey)) {
+      console.log(`${" ".repeat(offset)}[CIRCULAR REFERENCE: ${s.id.name}]`);
+      return;
+    }
+    printedSymbols.add(symbolKey);
+    
     // For overloaded functions, we need to resolve back to the specific declaration
     // that was used to create this symbol, not just use s.self
     const resolved = parser.resolveStableId(s.id);
@@ -76,6 +85,9 @@ async function processSymbols(
     listAllSymbols(tsConfigPath);
   } catch (error) {
     debugError(`Error processing project: ${(error as Error).message}`);
+    if (options.debug) {
+      console.error("Stack trace:", (error as Error).stack);
+    }
     process.exit(1);
   }
 }
