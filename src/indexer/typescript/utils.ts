@@ -3,6 +3,7 @@ import ts from "typescript";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 import { AccessPath, FoundExport, StableSymbolId } from "./TypeScript.js";
+import { debugError } from "../../utils/debug.js";
 
 /**
  * Extract a stable declaration "header" string for ID hashing and documentation.
@@ -905,21 +906,70 @@ export function resolveStableId(
       )
     );
     const pick = sorted[id.overloadIndex] ?? sorted[0];
+    let symbol = ((pick as any).symbol as ts.Symbol);
+    
+    if (!symbol) {
+      // Try to get symbol from name node if it exists
+      const nameNode = (pick as any).name;
+      if (nameNode) {
+        const nameSymbol = checker.getSymbolAtLocation(nameNode);
+        if (nameSymbol) {
+          symbol = nameSymbol;
+        }
+      }
+    }
+    
+    if (!symbol) {
+      // For anonymous declarations, try using symbolFromTarget helper
+      const targetSymbol = symbolFromTarget(checker, pick);
+      if (targetSymbol) {
+        symbol = targetSymbol;
+      }
+    }
+    
+    if (!symbol) {
+      debugError(`Could not resolve symbol for declaration ${ts.SyntaxKind[pick.kind]} "${declName(pick, checker)}" in ${pick.getSourceFile().fileName}`);
+      return undefined;
+    }
+    
     return {
       decl: pick,
-      symbol:
-        ((pick as any).symbol as ts.Symbol) ??
-        checker.getSymbolAtLocation((pick as any).name),
+      symbol,
     };
   }
 
   const decl = candidates[0];
   if (!decl) return undefined;
+  
+  let symbol = ((decl as any).symbol as ts.Symbol);
+  
+  if (!symbol) {
+    // Try to get symbol from name node if it exists
+    const nameNode = (decl as any).name;
+    if (nameNode) {
+      const nameSymbol = checker.getSymbolAtLocation(nameNode);
+      if (nameSymbol) {
+        symbol = nameSymbol;
+      }
+    }
+  }
+  
+  if (!symbol) {
+    // For anonymous declarations, try using symbolFromTarget helper
+    const targetSymbol = symbolFromTarget(checker, decl);
+    if (targetSymbol) {
+      symbol = targetSymbol;
+    }
+  }
+  
+  if (!symbol) {
+    debugError(`Could not resolve symbol for declaration ${ts.SyntaxKind[decl.kind]} "${declName(decl, checker)}" in ${decl.getSourceFile().fileName}`);
+    return undefined;
+  }
+  
   return {
     decl,
-    symbol:
-      ((decl as any).symbol as ts.Symbol) ??
-      checker.getSymbolAtLocation((decl as any).name),
+    symbol,
   };
 }
 

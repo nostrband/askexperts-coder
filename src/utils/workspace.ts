@@ -37,6 +37,22 @@ export function extractWorkspaces(projectPath: string): WorkspaceInfo[] {
     }
   }
 
+  // Check deno.json workspaces
+  const denoJsonPath = path.join(resolvedProjectPath, "deno.json");
+  if (fs.existsSync(denoJsonPath)) {
+    try {
+      const denoJson = JSON.parse(fs.readFileSync(denoJsonPath, "utf8"));
+      if (denoJson.workspace && Array.isArray(denoJson.workspace)) {
+        for (const pattern of denoJson.workspace) {
+          const expandedPaths = expandWorkspacePattern(resolvedProjectPath, pattern);
+          workspaces.push(...expandedPaths);
+        }
+      }
+    } catch (error) {
+      console.warn(`Failed to parse deno.json: ${error}`);
+    }
+  }
+
   // Check pnpm-workspace.yaml
   const pnpmWorkspacePath = path.join(resolvedProjectPath, "pnpm-workspace.yaml");
   if (fs.existsSync(pnpmWorkspacePath)) {
@@ -81,8 +97,10 @@ function expandWorkspacePattern(projectPath: string, pattern: string): Workspace
           if (entry.isDirectory()) {
             const fullPath = path.join(basePath, entry.name);
             
-            // Check if this directory has a package.json (indicating it's a package)
+            // Check if this directory has a package.json or deno.json (indicating it's a package)
             const packageJsonPath = path.join(fullPath, "package.json");
+            const denoJsonPath = path.join(fullPath, "deno.json");
+            
             if (fs.existsSync(packageJsonPath)) {
               let name: string | undefined;
               try {
@@ -90,6 +108,19 @@ function expandWorkspacePattern(projectPath: string, pattern: string): Workspace
                 name = packageJson.name;
               } catch {
                 // Ignore parsing errors for individual package.json files
+              }
+              
+              workspaces.push({
+                path: fullPath,
+                name
+              });
+            } else if (fs.existsSync(denoJsonPath)) {
+              let name: string | undefined;
+              try {
+                const denoJson = JSON.parse(fs.readFileSync(denoJsonPath, "utf8"));
+                name = denoJson.name;
+              } catch {
+                // Ignore parsing errors for individual deno.json files
               }
               
               workspaces.push({
@@ -104,6 +135,7 @@ function expandWorkspacePattern(projectPath: string, pattern: string): Workspace
       // Handle exact paths (no wildcards)
       const fullPath = path.resolve(projectPath, pattern);
       const packageJsonPath = path.join(fullPath, "package.json");
+      const denoJsonPath = path.join(fullPath, "deno.json");
       
       if (fs.existsSync(packageJsonPath)) {
         let name: string | undefined;
@@ -112,6 +144,19 @@ function expandWorkspacePattern(projectPath: string, pattern: string): Workspace
           name = packageJson.name;
         } catch {
           // Ignore parsing errors for individual package.json files
+        }
+        
+        workspaces.push({
+          path: fullPath,
+          name
+        });
+      } else if (fs.existsSync(denoJsonPath)) {
+        let name: string | undefined;
+        try {
+          const denoJson = JSON.parse(fs.readFileSync(denoJsonPath, "utf8"));
+          name = denoJson.name;
+        } catch {
+          // Ignore parsing errors for individual deno.json files
         }
         
         workspaces.push({

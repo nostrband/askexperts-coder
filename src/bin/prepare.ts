@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { execSync } from "node:child_process";
 import { Command } from "commander";
 import { debugCli, debugError, enableDebugAll } from "../utils/debug.js";
 import { TypeScript } from "../indexer/typescript/TypeScript.js";
@@ -30,6 +31,25 @@ function readFileAsUtf8(filePath: string): string {
 }
 
 /**
+ * Get the current commit hash from git
+ * @param projectPath - Path to the project root
+ * @returns Current commit hash or undefined if not in a git repository
+ */
+function getCurrentCommitHash(projectPath: string): string | undefined {
+  try {
+    const result = execSync('git rev-parse HEAD', {
+      cwd: projectPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    });
+    return result.trim();
+  } catch (error) {
+    debugError(`Failed to get current commit hash: ${(error as Error).message}`);
+    return undefined;
+  }
+}
+
+/**
  * Create a Doc object for an always-included file
  * @param filePath - Relative path to the file from project root
  * @param content - File content
@@ -44,7 +64,7 @@ function createAlwaysIncludedDoc(filePath: string, content: string, commitHash?:
   const baseId = createHash("sha256").update(`${filePath}:${content}`).digest("hex");
   const id = workspaceRelativePath ? `${workspaceRelativePath}:${baseId}` : baseId;
   
-  let metadata = '';
+  let metadata = 'type: file\n';
   if (workspaceRelativePath) {
     metadata += `workspace: ${workspaceRelativePath}\n`;
   }
@@ -70,31 +90,105 @@ function createAlwaysIncludedDoc(filePath: string, content: string, commitHash?:
 }
 
 /**
- * Process always-included files and write them as docs
- * @param packagePath - Path to the package
- * @param alwaysPaths - Array of file paths to always include
+ * Expand file masks (like "*.md") to actual file paths
+ * @param basePath - Base path to search from
+ * @param pattern - File pattern (can be exact path or mask like "*.md")
+ * @returns Array of matching file paths relative to basePath
+ */
+function expandFileMask(basePath: string, pattern: string): string[] {
+  // If pattern doesn't contain wildcards, treat as exact path
+  if (!pattern.includes('*') && !pattern.includes('?')) {
+    return [pattern];
+  }
+  
+  const results: string[] = [];
+  
+  try {
+    // Simple glob implementation for basic patterns like "*.md"
+    if (pattern.startsWith('*.')) {
+      const extension = pattern.slice(1); // Remove the '*'
+      const scanDirectory = (dirPath: string, relativePath: string = '') => {
+        const items = fs.readdirSync(dirPath, { withFileTypes: true });
+        
+        for (const item of items) {
+          const itemPath = path.join(dirPath, item.name);
+          const itemRelativePath = relativePath ? `${relativePath}/${item.name}` : item.name;
+          
+          if (item.isFile() && item.name.endsWith(extension)) {
+            results.push(itemRelativePath);
+          } else if (item.isDirectory() && !shouldIgnoreFile(itemRelativePath, [])) {
+            // Recursively scan subdirectories, but skip ignored ones
+            scanDirectory(itemPath, itemRelativePath);
+          }
+        }
+      };
+      
+      scanDirectory(basePath);
+    } else {
+      // For more complex patterns, we could add more sophisticated glob matching
+      // For now, just treat as exact path
+      results.push(pattern);
+    }
+  } catch (error) {
+    debugError(`Error expanding file mask "${pattern}": ${(error as Error).message}`);
+  }
+  
+  return results;
+}
+
+/**
+ * Handle always-included files for a given path (root or workspace)
+ * @param basePath - Base path to resolve files from (root or workspace path)
+ * @param rootProjectPath - Root project path for resolving --always options
+ * @param alwaysOptions - Array of --always paths provided by user (relative to root)
+ * @param useDefaults - Whether to include default always files
  * @param commitHash - Optional commit hash
  * @param outputFilePath - Optional output file path
  * @param outputDirPath - Optional output directory path
  * @param workspaceRelativePath - Optional workspace relative path for monorepos
  * @returns Number of processed files
  */
-async function processAlwaysIncludedFiles(
-  packagePath: string,
-  alwaysPaths: string[],
+async function handleAlwaysIncludedFiles(
+  basePath: string,
+  rootProjectPath: string,
+  alwaysOptions: string[],
+  useDefaults: boolean,
   commitHash?: string,
   outputFilePath?: string,
   outputDirPath?: string,
   workspaceRelativePath?: string
 ): Promise<number> {
   let processedCount = 0;
-
-  for (const relativePath of alwaysPaths) {
-    const fullPath = path.join(packagePath, relativePath);
+  
+  // Determine which files to process
+  let filesToProcess: string[] = [];
+  
+  if (alwaysOptions.length > 0) {
+    // User provided --always options, use them (they are relative to root)
+    filesToProcess = alwaysOptions.map(alwaysPath => {
+      // Convert root-relative path to basePath-relative path
+      const absoluteAlwaysPath = path.resolve(rootProjectPath, alwaysPath);
+      return path.relative(basePath, absoluteAlwaysPath);
+    });
+  } else if (useDefaults) {
+    // Use default always files - now includes "*.md" instead of just "README.md"
+    filesToProcess = ["package.json", "deno.json", "tsconfig.json", "*.md"];
+  }
+  
+  // Expand any file masks in the list
+  const expandedFiles: string[] = [];
+  for (const filePattern of filesToProcess) {
+    const expandedPaths = expandFileMask(basePath, filePattern);
+    expandedFiles.push(...expandedPaths);
+  }
+  
+  for (const relativePath of expandedFiles) {
+    const fullPath = path.resolve(basePath, relativePath);
     
     try {
       if (!fs.existsSync(fullPath)) {
-        debugError(`Always-included file not found: ${fullPath}`);
+        if (alwaysOptions.length > 0)
+          debugError(`Always-included file not found: ${fullPath}`);
         continue;
       }
 
@@ -106,7 +200,9 @@ async function processAlwaysIncludedFiles(
       debugCli(`Processing always-included file: ${relativePath}`);
       
       const content = readFileAsUtf8(fullPath);
-      const doc = createAlwaysIncludedDoc(relativePath, content, commitHash, workspaceRelativePath);
+      // Always use path relative to project root for metadata
+      const metadataPath = path.relative(rootProjectPath, fullPath);
+      const doc = createAlwaysIncludedDoc(metadataPath, content, commitHash, workspaceRelativePath);
 
       if (outputFilePath) {
         // Append the line to the output file
@@ -253,7 +349,7 @@ function generateFileTree(
  * @param workspaceRelativePath - Optional workspace relative path for monorepos
  * @returns Doc object for the project files
  */
-function createProjectFilesDoc(packagePath: string, workspaceRelativePath?: string): Doc {
+function createProjectFilesDoc(packagePath: string, workspaceRelativePath?: string, commitHash?: string): Doc {
   const timestamp = Math.floor(Date.now() / 1000);
   
   // Parse gitignore
@@ -266,14 +362,16 @@ function createProjectFilesDoc(packagePath: string, workspaceRelativePath?: stri
   fileTree += generateFileTree(packagePath, gitignorePatterns);
   
   // Create document ID with workspace prefix for monorepos
-  const baseId = `${packagePath}:project-files`;
-  const id = workspaceRelativePath ? `${workspaceRelativePath}:project-files` : baseId;
+  const baseId = `${packagePath}:project_files`;
+  const id = workspaceRelativePath ? `${workspaceRelativePath}:project_files` : baseId;
   
-  let metadata = '';
+  let metadata = 'type: project_files\n';
   if (workspaceRelativePath) {
     metadata += `workspace: ${workspaceRelativePath}\n`;
   }
-  metadata += 'project files';
+  if (commitHash) {
+    metadata += `commit: ${commitHash}\n`;
+  }
   
   const doc: Doc = {
     id,
@@ -289,41 +387,6 @@ function createProjectFilesDoc(packagePath: string, workspaceRelativePath?: stri
   };
   
   return doc;
-}
-
-/**
- * Create a workspace-aware version of symbolToDoc with modified metadata
- */
-function symbolToDocWithWorkspace(
-  symbolInfo: DocSymbol,
-  symbolInfos: DocSymbol[],
-  typescript: TypeScript,
-  commitHash?: string,
-  workspaceRelativePath?: string
-): Doc {
-  // Get the original doc
-  const doc = symbolToDoc(symbolInfo, symbolInfos, typescript, commitHash);
-  
-  // Modify metadata to include workspace and symbol ID
-  let metadata = '';
-  if (workspaceRelativePath) {
-    metadata += `workspace: ${workspaceRelativePath}\n`;
-  }
-  metadata += `file: ${symbolInfo.id.file}\n`;
-  metadata += `lines: ${symbolInfo.start.split(":")[0]}:${symbolInfo.end.split(":")[0]}\n`;
-  metadata += `id: ${symbolInfo.id.hash}`;
-  if (commitHash) {
-    metadata += `\ncommit: ${commitHash}`;
-  }
-  
-  // Modify doc ID for monorepos
-  const newId = workspaceRelativePath ? `${workspaceRelativePath}:${symbolInfo.id.hash}` : symbolInfo.id.hash;
-  
-  return {
-    ...doc,
-    id: newId,
-    metadata
-  };
 }
 
 /**
@@ -378,6 +441,53 @@ async function processDocs(
       fs.mkdirSync(outputDirPath, { recursive: true });
     }
 
+    // Get current commit hash from git
+    const currentCommitHash = getCurrentCommitHash(absolutePath);
+    if (!currentCommitHash) {
+      debugError("Failed to get current commit hash. Make sure you're in a git repository.");
+      process.exit(1);
+    }
+    debugCli(`Current commit hash: ${currentCommitHash}`);
+
+    // Handle always-included files for the root project first
+    debugCli(`Processing always-included files for project root`);
+    const rootAlwaysCount = await handleAlwaysIncludedFiles(
+      absolutePath,
+      absolutePath,
+      options.always || [],
+      true, // use defaults for root
+      currentCommitHash, // use current commit hash
+      outputFilePath,
+      outputDirPath,
+      undefined // no workspace path for root
+    );
+    debugCli(`Processed ${rootAlwaysCount} always-included files for project root`);
+
+    // Create and process the synthetic project files document for the entire project
+    debugCli(`Creating synthetic project files document for entire project`);
+    const projectFilesDoc = createProjectFilesDoc(absolutePath, undefined, currentCommitHash);
+    
+    if (outputFilePath) {
+      // Append the project files doc to the output file
+      fs.appendFileSync(
+        outputFilePath,
+        "=========================\n" +
+          projectFilesDoc.metadata +
+          "\n" +
+          projectFilesDoc.data +
+          "\n\n"
+      );
+    }
+
+    if (outputDirPath) {
+      // Write the project files doc to a separate file using hash of doc.id for filename
+      const fileNameHash = createHash("sha256").update(projectFilesDoc.id).digest("hex");
+      const docFilePath = path.join(outputDirPath, `${fileNameHash}.aedoc`);
+      fs.writeFileSync(docFilePath, JSON.stringify(projectFilesDoc, null, 2));
+    }
+
+    debugCli(`Created synthetic project files document for entire project`);
+
     // Check if this is a monorepo with workspaces
     const workspaces = extractWorkspaces(absolutePath);
     
@@ -386,12 +496,12 @@ async function processDocs(
       // Process each workspace
       for (const workspace of workspaces) {
         debugCli(`Processing workspace: ${workspace.name || workspace.path}`);
-        await processWorkspace(workspace.path, absolutePath, outputFilePath, outputDirPath, options);
+        await processWorkspace(workspace.path, absolutePath, outputFilePath, outputDirPath, options, currentCommitHash);
       }
     } else {
       // Process as a single package
       debugCli(`Processing as single package`);
-      await processWorkspace(absolutePath, absolutePath, outputFilePath, outputDirPath, options);
+      await processWorkspace(absolutePath, absolutePath, outputFilePath, outputDirPath, options, currentCommitHash);
     }
 
   } catch (error) {
@@ -408,7 +518,8 @@ async function processWorkspace(
   rootProjectPath: string,
   outputFilePath?: string,
   outputDirPath?: string,
-  options?: { debug?: boolean; output?: string; dir?: string; always?: string[]; docs?: string }
+  options?: { debug?: boolean; output?: string; dir?: string; always?: string[]; docs?: string },
+  currentCommitHash?: string
 ): Promise<void> {
   const workspaceRelativePath = path.relative(rootProjectPath, workspacePath);
   const isMonorepo = workspaceRelativePath !== '';
@@ -435,142 +546,158 @@ async function processWorkspace(
     return; // Skip this workspace instead of exiting
   }
 
-  // Read commit hash from commit.git file
+  // Read commit hash from commit.git file and validate it matches current commit
   const commitFilePath = path.join(docsPath, "commit.git");
-  let commitHash: string | undefined;
+  let docsCommitHash: string | undefined;
   if (fs.existsSync(commitFilePath)) {
-    commitHash = fs.readFileSync(commitFilePath, "utf8").trim();
-    debugCli(`Found commit hash: ${commitHash}`);
+    docsCommitHash = fs.readFileSync(commitFilePath, "utf8").trim();
+    debugCli(`Found docs commit hash: ${docsCommitHash}`);
+    
+    // Validate that docs commit hash matches current commit hash
+    if (currentCommitHash && docsCommitHash !== currentCommitHash) {
+      debugError(`Commit hash mismatch! Current commit: ${currentCommitHash}, Docs commit: ${docsCommitHash}`);
+      debugError("The generated docs are from a different commit than the current files.");
+      debugError("Please regenerate the docs or checkout the correct commit.");
+      process.exit(1);
+    }
   } else {
-    debugCli("No commit.git file found, proceeding without commit hash");
+    debugCli("No commit.git file found, proceeding without docs commit hash validation");
   }
 
   debugCli(`Looking for JSON files in: ${docsPath}`);
 
   const typescript = new TypeScript(workspacePath);
 
-  // Handle always-included files
-  const alwaysPaths = options?.always && options.always.length > 0
-    ? options.always
-    : ["package.json", "tsconfig.json", "README.md"];
-  
-  debugCli(`Processing always-included files: ${alwaysPaths.join(", ")}`);
-  
-  const alwaysProcessedCount = await processAlwaysIncludedFiles(
-    workspacePath,
-    alwaysPaths,
-    commitHash,
-    outputFilePath,
-    outputDirPath,
-    isMonorepo ? workspaceRelativePath : undefined
-  );
-
-  debugCli(`Processed ${alwaysProcessedCount} always-included files`);
-
-  // Create and process the synthetic project files document
-  debugCli(`Creating synthetic project files document`);
-  const projectFilesDoc = createProjectFilesDoc(workspacePath, isMonorepo ? workspaceRelativePath : undefined);
-  
-  if (outputFilePath) {
-    // Append the project files doc to the output file
-    fs.appendFileSync(
+  // Handle always-included files only if --always options weren't provided
+  // (if they were provided, they were already handled at the root level)
+  let alwaysProcessedCount = 0;
+  if (!options?.always || options.always.length === 0) {
+    debugCli(`Processing default always-included files for workspace`);
+    alwaysProcessedCount = await handleAlwaysIncludedFiles(
+      workspacePath,
+      rootProjectPath,
+      [], // no --always options
+      true, // use defaults
+      currentCommitHash, // use current commit hash for consistency
       outputFilePath,
-      "=========================\n" +
-        projectFilesDoc.metadata +
-        "\n" +
-        projectFilesDoc.data +
-        "\n\n"
+      outputDirPath,
+      isMonorepo ? workspaceRelativePath : undefined
     );
+    debugCli(`Processed ${alwaysProcessedCount} always-included files`);
+  } else {
+    debugCli(`Skipping workspace always-included files (handled at root level)`);
   }
 
-  if (outputDirPath) {
-    // Write the project files doc to a separate file using hash of doc.id for filename
-    const fileNameHash = createHash("sha256").update(projectFilesDoc.id).digest("hex");
-    const docFilePath = path.join(outputDirPath, `${fileNameHash}.aedoc`);
-    fs.writeFileSync(docFilePath, JSON.stringify(projectFilesDoc, null, 2));
-  }
-
-  debugCli(`Created synthetic project files document`);
+  // Note: project_files doc is now created at project root level, not per workspace
 
   // Track statistics
-  let processedFiles = 0;
-  let processedLines = 0;
+  let processedSymbols = 0;
+  let foundSymbols = 0;
+  let missingSymbols = 0;
 
-  // Recursively process all JSON files in the INDEXER_DIR directory
-  const processDirectory = async (dirPath: string) => {
+  // Get all symbols from TypeScript analysis
+  debugCli(`Getting all symbols from TypeScript analysis...`);
+  const allSymbols = typescript.listAllSymbols();
+  debugCli(`Found ${allSymbols.length} symbols from TypeScript analysis`);
+
+  // Create a map of all available DocSymbols from JSON files for quick lookup
+  const docSymbolMap = new Map<string, { symbolInfo: DocSymbol; allSymbolInfos: DocSymbol[] }>();
+  
+  // Recursively scan all JSON files to build the map
+  const scanJsonFiles = (dirPath: string) => {
+    if (!fs.existsSync(dirPath)) return;
+    
     const items = fs.readdirSync(dirPath);
-
     for (const item of items) {
       const itemPath = path.join(dirPath, item);
       const stats = fs.statSync(itemPath);
 
       if (stats.isDirectory()) {
-        // Recursively process subdirectories
-        await processDirectory(itemPath);
+        scanJsonFiles(itemPath);
       } else if (stats.isFile() && path.extname(itemPath) === ".json") {
-        // Process JSON files
-        debugCli(`Processing file: ${itemPath}`);
-
         try {
           const content = fs.readFileSync(itemPath, "utf8");
           const lines = content.trim().split("\n");
           const symbolInfos: DocSymbol[] = [];
+          
           for (const line of lines) {
             if (!line.trim()) continue;
             const symbolInfo = JSON.parse(line) as DocSymbol;
             symbolInfos.push(symbolInfo);
           }
 
+          // Add each symbol to the map using its hash as key
           for (const symbolInfo of symbolInfos) {
-            const doc = symbolToDocWithWorkspace(
-              symbolInfo,
-              symbolInfos,
-              typescript,
-              commitHash,
-              isMonorepo ? workspaceRelativePath : undefined
-            );
-
-            if (outputFilePath) {
-              // Append the line to the output file
-              fs.appendFileSync(
-                outputFilePath,
-                "=========================\n" +
-                  doc.metadata +
-                  "\n" +
-                  doc.data +
-                  "\n\n"
-              );
-            }
-
-            if (outputDirPath) {
-              // Write each doc to a separate file using hash of doc.id for filename
-              const fileNameHash = createHash("sha256").update(doc.id).digest("hex");
-              const docFilePath = path.join(outputDirPath, `${fileNameHash}.aedoc`);
-              fs.writeFileSync(docFilePath, JSON.stringify(doc, null, 2));
-            }
-
-            processedLines++;
-
-            if (processedLines % 100 === 0) {
-              debugCli(`Processed ${processedLines} lines so far...`);
+            if (symbolInfo.id && symbolInfo.id.hash) {
+              docSymbolMap.set(symbolInfo.id.hash, { symbolInfo, allSymbolInfos: symbolInfos });
             }
           }
-
-          processedFiles++;
         } catch (error) {
-          debugError(
-            `Error processing file ${itemPath}: ${(error as Error).message}`
-          );
+          debugError(`Error reading JSON file ${itemPath}: ${(error as Error).message}`);
         }
       }
     }
   };
 
-  // Start processing
-  await processDirectory(docsPath);
+  debugCli(`Scanning JSON files in: ${docsPath}`);
+  scanJsonFiles(docsPath);
+  debugCli(`Found ${docSymbolMap.size} symbols in JSON files`);
+
+  // Process each symbol from TypeScript analysis
+  for (const symbol of allSymbols) {
+    processedSymbols++;
+    
+    if (processedSymbols % 100 === 0) {
+      debugCli(`Processed ${processedSymbols}/${allSymbols.length} symbols so far...`);
+    }
+
+    // Look for matching DocSymbol in JSON files
+    const symbolHash = symbol.id.hash;
+    const docSymbolEntry = docSymbolMap.get(symbolHash);
+    
+    if (!docSymbolEntry) {
+      debugError(`Symbol not found in JSON files: ${symbol.id.name} (${symbol.id.kind}) in ${symbol.id.file} - hash: ${symbolHash}`);
+      missingSymbols++;
+      continue;
+    }
+
+    foundSymbols++;
+    const { symbolInfo, allSymbolInfos } = docSymbolEntry;
+
+    try {
+      const doc = symbolToDoc(
+        symbolInfo,
+        allSymbolInfos,
+        typescript,
+        docsCommitHash, // use docs commit hash for symbol docs (they were generated from that commit)
+        isMonorepo ? workspaceRelativePath : undefined
+      );
+
+      if (outputFilePath) {
+        // Append the line to the output file
+        fs.appendFileSync(
+          outputFilePath,
+          "=========================\n" +
+            doc.metadata +
+            "\n" +
+            doc.data +
+            "\n\n"
+        );
+      }
+
+      if (outputDirPath) {
+        // Write each doc to a separate file using hash of doc.id for filename
+        const fileNameHash = createHash("sha256").update(doc.id).digest("hex");
+        const docFilePath = path.join(outputDirPath, `${fileNameHash}.aedoc`);
+        fs.writeFileSync(docFilePath, JSON.stringify(doc, null, 2));
+      }
+    } catch (error) {
+      debugError(`Error processing symbol ${symbolInfo.id.name}: ${(error as Error).message}`);
+    }
+  }
 
   debugCli(`Workspace preparation complete.`);
-  debugCli(`Processed ${alwaysProcessedCount} always-included files and ${processedFiles} JSON files with ${processedLines} lines.`);
+  debugCli(`Processed ${alwaysProcessedCount} always-included files and ${processedSymbols} symbols (${foundSymbols} found, ${missingSymbols} missing).`);
 }
 
 /**

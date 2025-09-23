@@ -98,6 +98,7 @@ import {
   resolveStableId,
   shouldSkipAsLocal,
 } from "./utils.js";
+import { denoConfigToTsConfig } from "./deno2tsconfig.js";
 
 export type FoundExport = {
   exportName: string;
@@ -227,27 +228,77 @@ export class TypeScript {
   constructor(projectDir: string, tsconfigName = "tsconfig.json") {
     this.projectDir = path.resolve(projectDir);
 
-    const configPath = ts.findConfigFile(
+    // Try to find existing tsconfig first
+    let configPath = ts.findConfigFile(
       this.projectDir,
       ts.sys.fileExists,
       tsconfigName
     );
-    if (!configPath)
-      throw new Error(`No ${tsconfigName} under ${this.projectDir}`);
+    
+    let parsed: ts.ParsedCommandLine;
+    
+    if (configPath) {
+      // Use existing tsconfig.json
+      const host: ts.ParseConfigFileHost = {
+        ...ts.sys,
+        onUnRecoverableConfigFileDiagnostic: (d) => {
+          throw new Error(ts.flattenDiagnosticMessageText(d.messageText, "\n"));
+        },
+      };
 
-    const host: ts.ParseConfigFileHost = {
-      ...ts.sys,
-      onUnRecoverableConfigFileDiagnostic: (d) => {
-        throw new Error(ts.flattenDiagnosticMessageText(d.messageText, "\n"));
-      },
-    };
+      const parsedConfig = ts.getParsedCommandLineOfConfigFile(configPath, {}, host);
+      if (!parsedConfig) throw new Error(`Failed to parse ${configPath}`);
+      parsed = parsedConfig;
+    } else {
+      // Check if deno.json exists and generate tsconfig from it
+      const denoJsonPath = path.join(this.projectDir, "deno.json");
+      if (fs.existsSync(denoJsonPath)) {
+        const denoConfigText = fs.readFileSync(denoJsonPath, "utf8");
+        const tsconfigText = denoConfigToTsConfig(denoConfigText);
+        
+        // Parse the generated tsconfig
+        const tsconfigJson = ts.parseConfigFileTextToJson("tsconfig.json", tsconfigText);
+        if (tsconfigJson.error) {
+          throw new Error(`Failed to parse generated tsconfig: ${ts.flattenDiagnosticMessageText(tsconfigJson.error.messageText, "\n")}`);
+        }
+        
+        const host: ts.ParseConfigHost = {
+          useCaseSensitiveFileNames: true,
+          readDirectory: ts.sys.readDirectory,
+          fileExists: ts.sys.fileExists,
+          readFile: ts.sys.readFile,
+        };
+        
+        parsed = ts.parseJsonConfigFileContent(
+          tsconfigJson.config,
+          host,
+          this.projectDir
+        );
+        
+        if (parsed.errors.length > 0) {
+          const errorMessages = parsed.errors.map(e => ts.flattenDiagnosticMessageText(e.messageText, "\n"));
+          throw new Error(`Failed to parse generated tsconfig: ${errorMessages.join(", ")}`);
+        }
+      } else {
+        throw new Error(`No ${tsconfigName} or deno.json found under ${this.projectDir}`);
+      }
+    }
 
-    const parsed = ts.getParsedCommandLineOfConfigFile(configPath, {}, host);
-    if (!parsed) throw new Error(`Failed to parse ${configPath}`);
-
-    this.packageJson = JSON.parse(
-      fs.readFileSync(this.projectDir + "/package.json").toString()
-    );
+    // Try to read package.json first, fallback to deno.json
+    const packageJsonPath = path.join(this.projectDir, "package.json");
+    const denoJsonPath = path.join(this.projectDir, "deno.json");
+    
+    if (fs.existsSync(packageJsonPath)) {
+      this.packageJson = JSON.parse(
+        fs.readFileSync(packageJsonPath).toString()
+      );
+    } else if (fs.existsSync(denoJsonPath)) {
+      this.packageJson = JSON.parse(
+        fs.readFileSync(denoJsonPath).toString()
+      );
+    } else {
+      throw new Error(`No package.json or deno.json found in ${this.projectDir}`);
+    }
 
     const rootNames = parsed.fileNames.filter((f) =>
       path.resolve(f).startsWith(this.projectDir)
@@ -1540,7 +1591,7 @@ export class TypeScript {
     const declKey = `${sf.fileName}:${decl.getStart(sf)}:${ts.SyntaxKind[decl.kind]}`;
     
     if (this.relatedCallStack.has(declKey)) {
-      console.log(`[RELATED] Circular reference detected for: ${declKey}`);
+      this.dbg(`Circular reference detected in related() for: ${declKey}`);
       return []; // Return empty to break the cycle
     }
     

@@ -1,6 +1,6 @@
 import { Command } from "commander";
 import { debugError } from "askexperts/common";
-import { enableDebugAll } from "../utils/debug.js";
+import { enableDebugAll, debugTypescript } from "../utils/debug.js";
 import { Symbol, TypeScript } from "../indexer/typescript/TypeScript.js";
 import { extractWorkspaces } from "../utils/workspace.js";
 import path from "path";
@@ -22,10 +22,12 @@ export function listAllSymbols(projectPath: string) {
 }
 
 function listAllSymbolsForWorkspace(workspacePath: string, rootProjectPath: string) {
-  // Check if tsconfig.json exists in this workspace
+  // Check if tsconfig.json or deno.json exists in this workspace
   const tsconfigPath = path.join(workspacePath, 'tsconfig.json');
-  if (!fs.existsSync(tsconfigPath)) {
-    console.log(`Skipping workspace ${workspacePath} - no tsconfig.json found`);
+  const denoJsonPath = path.join(workspacePath, 'deno.json');
+  
+  if (!fs.existsSync(tsconfigPath) && !fs.existsSync(denoJsonPath)) {
+    console.log(`Skipping workspace ${workspacePath} - no tsconfig.json or deno.json found`);
     return;
   }
   
@@ -41,7 +43,8 @@ function listAllSymbolsForWorkspace(workspacePath: string, rootProjectPath: stri
     // Prevent infinite recursion by tracking printed symbols
     const symbolKey = `${s.id.file}:${s.id.name}:${s.id.kind}:${s.id.overloadIndex}`;
     if (printedSymbols.has(symbolKey)) {
-      console.log(`${" ".repeat(offset)}[CIRCULAR REFERENCE: ${s.id.name}]`);
+      debugTypescript(`Circular reference detected in symbol hierarchy: ${s.id.name} at ${s.id.file}`);
+      // console.log(`${" ".repeat(offset)}[CIRCULAR REFERENCE: ${s.id.name}]`);
       return;
     }
     printedSymbols.add(symbolKey);

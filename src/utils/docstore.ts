@@ -1,3 +1,4 @@
+import path from "node:path";
 import { Doc } from "askexperts/docstore";
 import {
   StableSymbolId,
@@ -23,7 +24,8 @@ export function symbolToDoc(
   symbolInfo: DocSymbol,
   symbolInfos: DocSymbol[],
   typescript: TypeScript,
-  commitHash?: string
+  commitHash?: string,
+  workspaceRelativePath?: string
 ): Doc {
   // Create timestamps (current time in seconds)
   const timestamp = Math.floor(Date.now() / 1000);
@@ -44,11 +46,22 @@ export function symbolToDoc(
   const paths = typescript.pathsToRanked(symbol);
 
   // Doc metadata
-  let metadata = `
-file: ${symbolInfo.id.file}
-lines: ${symbolInfo.start.split(":")[0]}:${symbolInfo.end.split(":")[0]}
-`.trim();
-  if (commitHash) metadata += `\ncommit: ${commitHash}`;
+  let metadata = '';
+  if (workspaceRelativePath) {
+    metadata += `workspace: ${workspaceRelativePath}\n`;
+  }
+  
+  // Make file path relative to project root instead of workspace
+  const filePathFromRoot = workspaceRelativePath
+    ? path.posix.join(workspaceRelativePath, symbolInfo.id.file)
+    : symbolInfo.id.file;
+  
+  metadata += `file: ${filePathFromRoot}\n`;
+  metadata += `lines: ${symbolInfo.start.split(":")[0]}:${symbolInfo.end.split(":")[0]}\n`;
+  metadata += `id: ${symbolInfo.id.hash}\n`;
+  if (commitHash) {
+    metadata += `commit: ${commitHash}\n`;
+  }
 
   // Prefix/suffix for 'interface'
   let parentPrefix = "";
@@ -115,8 +128,11 @@ ${symbolInfo.summary}
   if (usage) content += `\n\nimport/access examples:\n${usage}`;
 
   // Create Doc object
+  // Modify doc ID for monorepos
+  const docId = workspaceRelativePath ? `${workspaceRelativePath}:${symbolInfo.id.hash}` : symbolInfo.id.hash;
+  
   const doc: Doc = {
-    id: symbolInfo.id.hash,
+    id: docId,
     docstore_id: "", // This will be set when the document is added to a docstore
     timestamp,
     created_at: timestamp, // Same as timestamp for new documents
