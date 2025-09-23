@@ -69,9 +69,7 @@ function createIncludedDoc(
   const timestamp = Math.floor(Date.now() / 1000);
 
   // Create ID with workspace prefix for monorepos
-  const baseId = createHash("sha256")
-    .update(`${filePath}:${content}`)
-    .digest("hex");
+  const baseId = filePath;
   const id = workspaceRelativePath
     ? `${workspaceRelativePath}:${baseId}`
     : baseId;
@@ -461,7 +459,7 @@ function createProjectFilesDoc(
   fileTree += generateFileTree(packagePath, gitignorePatterns);
 
   // Create document ID with workspace prefix for monorepos
-  const baseId = `${packagePath}:project_files`;
+  const baseId = `project_files`;
   const id = workspaceRelativePath
     ? `${workspaceRelativePath}:project_files`
     : baseId;
