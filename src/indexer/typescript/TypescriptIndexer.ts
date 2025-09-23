@@ -7,6 +7,66 @@ import { ChatCompletion, ChatCompletionCreateParams } from "openai/resources";
 const DEFAULT_MODEL = "anthropic/claude-3.7-sonnet";
 const DEFAULT_FALLBACK_MODEL = "openai/gpt-oss-120b";
 const DEFAULT_MAX_AMOUNT = 100;
+const DEFAULT_PROMPT = `
+You are a TypeScript expert, your task is to create documentation for every symbol in a typescript project.
+
+User will provide:
+1. .ts file path within the project.
+2. The contents of the file, with line numbers prepended in "<lineNumber>|<codeLine>" format.
+3. Description of the symbol with name, declaration and start/end line:column numbers.
+
+You job is:
+1. Create a short documentation of the public "side" of the symbol - what it does, what params accepts, what is returned,
+what public side effects happen, etc.
+2. Create a short documentation of the implementation details of the symbol - what it does, how it works, what main
+components/modules/functions are used, anything that would help a coder get a rough vision of the implementation without
+reading the full source code. If the symbol is trivial, leave this doc entry empty.
+3. Return a document in this JSON format (no markdown!): "{ summary: <public_docs>, details: <implementation_docs> }"
+4. Make sure you return valid json with escaped line-breaks in "details" field, especially important when your
+details contain numbered lists.
+
+If the provided input is invalid, return "ERROR: <reason>" string.
+`;
+
+const DEFAULT_FILE_PROMPT = `
+You are a TypeScript expert, your task is to create a summary documentation for a typescript file.
+
+User will provide:
+1. .ts file path within the project.
+2. The contents of the file, with line numbers prepended in "<lineNumber>|<codeLine>" format.
+
+You job is:
+1. Create a short summary of the public "side" of the file - main exported symbols, their purpose, what they do and how. 
+Be brief, several sentences should be enough, this summary only serves as a pointer for deeper investigation of the file
+contents.
+2. Create a short summary of the implementation details of the file - how things work, what main
+components/modules/functions are used, anything that would help a coder get a rough vision of the implementation without
+reading the full source code. If the file is trivial, leave this doc entry empty.
+3. Return a document in this JSON format (no markdown!): "{ summary: <public_docs>, details: <implementation_docs> }"
+4. Make sure you return valid json with escaped line-breaks in "details" field, especially important when your
+details contain numbered lists.
+
+If the provided input is invalid, return "ERROR: <reason>" string.
+`;
+
+const DEFAULT_DIR_PROMPT = `
+You are a TypeScript expert, your task is to create a summary documentation for a directory with typescript files.
+
+User will provide:
+1. Dir path within the project.
+2. Dir structure (tree of files in the dir).
+3. The summaries for each of the typescript file (purpose, main exported symbols, etc)
+
+You job is:
+1. Create a short summary of the public "side" of the dir - main exported symbols, overall purpose, general theme 
+of files grouped in this dir. Be brief, several sentences should be enough, this summary only serves as a pointer for 
+deeper investigation of the dir contents.
+2. Return a document in this JSON format (no markdown!): "{ summary: <public_docs> }"
+3. Make sure you return valid json with escaped line-breaks in "details" field, especially important when your
+details contain numbered lists.
+
+If the provided input is invalid, return "ERROR: <reason>" string.
+`;
 
 /**
  * A class for analyzing TypeScript files and generating documentation
@@ -23,13 +83,13 @@ export class TypescriptIndexer {
 
   constructor(options: {
     nwc: string;
-    systemPrompt: string;
+    systemPrompt?: string;
     pool?: SimplePool;
     maxAmount?: number;
     expertPubkey?: string;
     fallbackExpertPubkey?: string;
   }) {
-    this.systemPrompt = options.systemPrompt;
+    this.systemPrompt = options.systemPrompt || DEFAULT_PROMPT;
     this.expertPubkey = options.expertPubkey || DEFAULT_MODEL;
     this.fallbackExpertPubkey =
       options.fallbackExpertPubkey || DEFAULT_FALLBACK_MODEL;

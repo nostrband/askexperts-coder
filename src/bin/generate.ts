@@ -325,27 +325,7 @@ async function processWorkspace(
 
   const indexer = new TypescriptIndexer({
     nwc: nwcString,
-    maxAmount: options.maxAmount,
-    systemPrompt: `
-You are a TypeScript expert, your task is to create documentation for every symbol in a typescript project.
-
-User will provide:
-1. .ts file path within the project.
-2. The contents of the file, with line numbers prepended in "<lineNumber>|<codeLine>" format.
-3. Description of the symbol with name, declaration and start/end line:column numbers.
-
-You job is:
-1. Create a short documentation of the public "side" of the symbol - what it does, what params accepts, what is returned,
-what public side effects happen, etc.
-2. Create a short documentation of the implementation details of the symbol - what it does, how it works, what main
-components/modules/functions are used, anything that would help a coder get a rough vision of the implementation without
-reading the full source code. If the symbol is trivial, leave this doc entry empty.
-3. Return a document in this JSON format (no markdown!): "{ summary: <public_docs>, details: <implementation_docs> }"
-4. Make sure you return valid json with escaped line-breaks in "details" field, especially important when your
-details contain numbered lists.
-
-If the provided input is invalid, return "ERROR: <reason>" string.
-`
+    maxAmount: options.maxAmount
   });
 
     /**
@@ -371,6 +351,11 @@ If the provided input is invalid, return "ERROR: <reason>" string.
       },
       options: { debug?: boolean; nwc?: string; name?: string; continue?: boolean; threads?: number; branch?: string; dir?: string; maxAmount?: number }
     ): Promise<void> {
+      // ======================================
+      // NOTE: the file-caching is non-async and that's the
+      // only reason it works with our multi-threaded symbol handler,
+      // if async is introduced we'll have races with cache access
+
       // Check if we need to load a new file
       if (symbol.id.file !== fileCache.currentFile) {
         fileCache.currentFile = symbol.id.file;
@@ -416,6 +401,8 @@ If the provided input is invalid, return "ERROR: <reason>" string.
         debugCli(`Skipping already documented symbol: ${symbol.id.name}`);
         return;
       }
+      // sync section
+      // ========================================================
 
       const docs = await indexer.processSymbol(symbol.id.file, fileCache.fileContent, symbol);
       console.log("docs: ", JSON.stringify(docs, null, 2));
