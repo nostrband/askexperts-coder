@@ -273,10 +273,12 @@ async function processWorkspace(
   const workspaceRelativePath = path.relative(rootProjectPath, workspacePath);
   const workspacePrefix = workspaceRelativePath ? workspaceRelativePath + "/" : "";
   
-  // Check if tsconfig.json exists in the workspace
+  // Check if tsconfig.json or deno.json exists in the workspace
   const tsconfigPath = path.join(workspacePath, 'tsconfig.json');
-  if (!fs.existsSync(tsconfigPath)) {
-    debugCli(`Skipping workspace ${workspacePath}: no tsconfig.json found`);
+  const denoJsonPath = path.join(workspacePath, 'deno.json');
+  
+  if (!fs.existsSync(tsconfigPath) && !fs.existsSync(denoJsonPath)) {
+    debugCli(`Skipping workspace ${workspacePath}: no tsconfig.json or deno.json found`);
     return;
   }
   
