@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "@noble/hashes": "^1.8.0",
-    "askexperts": "^0.7.128",
+    "askexperts": "^0.7.132",
     "commander": "^11.0.0",
     "debug": "^4.4.1",
     "nostr-tools": "^2.16.2",

@@ -667,9 +667,15 @@ async function processDirectorySummary(
         if (stats.isFile() && path.extname(itemPath) === ".json" && item !== "summary.json") {
           try {
             const content = fs.readFileSync(itemPath, "utf8");
-            const jsonData = JSON.parse(content);
-            if (jsonData.type === "file") {
-              fileSummaries.push(jsonData);
+            const lines = content.trim().split('\n');
+            
+            for (const line of lines) {
+              if (line.trim()) {
+                const jsonData = JSON.parse(line);
+                if (jsonData.type === "file") {
+                  fileSummaries.push(jsonData);
+                }
+              }
             }
           } catch (error) {
             debugError(`Error reading file summary ${itemPath}: ${(error as Error).message}`);
@@ -680,9 +686,15 @@ async function processDirectorySummary(
           if (fs.existsSync(subDirSummaryPath)) {
             try {
               const content = fs.readFileSync(subDirSummaryPath, "utf8");
-              const jsonData = JSON.parse(content);
-              if (jsonData.type === "dir") {
-                fileSummaries.push(jsonData);
+              const lines = content.trim().split('\n');
+              
+              for (const line of lines) {
+                if (line.trim()) {
+                  const jsonData = JSON.parse(line);
+                  if (jsonData.type === "dir") {
+                    fileSummaries.push(jsonData);
+                  }
+                }
               }
             } catch (error) {
               debugError(`Error reading directory summary ${subDirSummaryPath}: ${(error as Error).message}`);
