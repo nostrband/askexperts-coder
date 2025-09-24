@@ -14,6 +14,44 @@ import {
 } from "../indexer/typescript/utils.js";
 import ts from "typescript";
 
+/**
+ * Format git link based on origin and file information
+ * @param origin - Git remote origin URL
+ * @param commitHash - Commit hash
+ * @param filePath - Path to the file relative to project root
+ * @param line - Optional line number for symbols
+ * @returns Formatted git link
+ */
+export function formatGitLink(
+  origin: string,
+  commitHash: string,
+  filePath: string,
+  line?: number
+): string {
+  // Clean up the origin URL - remove .git suffix and convert SSH to HTTPS
+  let cleanOrigin = origin;
+  
+  // Convert SSH format to HTTPS
+  if (cleanOrigin.startsWith("git@")) {
+    cleanOrigin = cleanOrigin
+      .replace(/^git@([^:]+):/, "https://$1/")
+      .replace(/\.git$/, "");
+  } else if (cleanOrigin.endsWith(".git")) {
+    cleanOrigin = cleanOrigin.replace(/\.git$/, "");
+  }
+  
+  // Determine the platform and format accordingly
+  if (cleanOrigin.includes("gitlab.com") || cleanOrigin.includes("gitlab.")) {
+    // GitLab format: <origin>/-/blob/<commitHash>/<filePath>#L<line>
+    const baseUrl = `${cleanOrigin}/-/blob/${commitHash}/${filePath}`;
+    return line ? `${baseUrl}#L${line}` : baseUrl;
+  } else {
+    // GitHub format (default): <origin>/blob/<commitHash>/<filePath>#L<line>
+    const baseUrl = `${cleanOrigin}/blob/${commitHash}/${filePath}`;
+    return line ? `${baseUrl}#L${line}` : baseUrl;
+  }
+}
+
 export type DocSymbol = Symbol & {
   parentId?: StableSymbolId;
   summary: string;
@@ -25,7 +63,8 @@ export function symbolToDoc(
   symbolInfos: DocSymbol[],
   typescript: TypeScript,
   commitHash?: string,
-  workspaceRelativePath?: string
+  workspaceRelativePath?: string,
+  gitOrigin?: string
 ): Doc {
   // Create timestamps (current time in seconds)
   const timestamp = Math.floor(Date.now() / 1000);
@@ -61,6 +100,12 @@ export function symbolToDoc(
   metadata += `id: ${symbolInfo.id.hash}\n`;
   if (commitHash) {
     metadata += `commit: ${commitHash}\n`;
+  }
+  if (gitOrigin && commitHash) {
+    // For symbols, include line number in the git link
+    const startLine = parseInt(symbolInfo.start.split(":")[0]);
+    const gitLink = formatGitLink(gitOrigin, commitHash, filePathFromRoot, startLine);
+    metadata += `link: ${gitLink}\n`;
   }
 
   // Prefix/suffix for 'interface'

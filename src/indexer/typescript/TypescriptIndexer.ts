@@ -79,17 +79,23 @@ export class TypescriptIndexer {
   private expertPubkey: string;
   private fallbackExpertPubkey: string;
   private systemPrompt: string;
+  private fileSystemPrompt: string;
+  private dirSystemPrompt: string;
   private maxAmount?: number;
 
   constructor(options: {
     nwc: string;
     systemPrompt?: string;
+    fileSystemPrompt?: string;
+    dirSystemPrompt?: string;
     pool?: SimplePool;
     maxAmount?: number;
     expertPubkey?: string;
     fallbackExpertPubkey?: string;
   }) {
     this.systemPrompt = options.systemPrompt || DEFAULT_PROMPT;
+    this.fileSystemPrompt = options.fileSystemPrompt || DEFAULT_FILE_PROMPT;
+    this.dirSystemPrompt = options.dirSystemPrompt || DEFAULT_DIR_PROMPT;
     this.expertPubkey = options.expertPubkey || DEFAULT_MODEL;
     this.fallbackExpertPubkey =
       options.fallbackExpertPubkey || DEFAULT_FALLBACK_MODEL;
@@ -111,57 +117,12 @@ export class TypescriptIndexer {
   public async start() {}
 
   /**
-   * Process a TypeScript file code and extract documentation
+   * Send a request to the expert model with fallback support
    *
-   * @param code - Contents of the TypeScript file to process
-   * @throws Error - Currently throws an error as implementation is pending
+   * @param request - The chat completion request
+   * @returns The parsed JSON response
    */
-  public async processSymbol(
-    file: string,
-    code: string,
-    symbol: any
-  ): Promise<any> {
-    debugTypescript(`Processing code of length: ${code.length}`);
-
-    // Prepend line numbers to code string
-    const codeLines = code
-      .split("\n")
-      .map((line, index) => `${index + 1}|${line}`)
-      .join("\n");
-
-    const request: ChatCompletionCreateParams = {
-      model: this.expertPubkey,
-      temperature: 0.1,
-      messages: [
-        {
-          role: "system",
-          content: this.systemPrompt,
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: `File: ${file}`,
-            },
-            {
-              type: "text",
-              text: codeLines,
-              // NOTE: we're forcing the model to cache the code
-              // FIXME doesn't seem to work properly
-              // @ts-ignore
-              cache_control: {
-                type: "ephemeral",
-              },
-            },
-            {
-              type: "text",
-              text: JSON.stringify(symbol),
-            },
-          ],
-        },
-      ],
-    };
+  private async askExpert(request: ChatCompletionCreateParams): Promise<any> {
     const quote = await this.client.getQuote(this.expertPubkey, request);
 
     if (this.maxAmount && quote.amountSats > this.maxAmount) {
@@ -216,6 +177,157 @@ export class TypescriptIndexer {
         throw fallbackError;
       }
     }
+  }
+
+  /**
+   * Process a TypeScript file code and extract documentation
+   *
+   * @param file - File path
+   * @param code - Contents of the TypeScript file to process
+   * @param symbol - Symbol to process
+   * @returns Documentation object
+   */
+  public async processSymbol(
+    file: string,
+    code: string,
+    symbol: any
+  ): Promise<any> {
+    debugTypescript(`Processing code of length: ${code.length}`);
+
+    // Prepend line numbers to code string
+    const codeLines = code
+      .split("\n")
+      .map((line, index) => `${index + 1}|${line}`)
+      .join("\n");
+
+    const request: ChatCompletionCreateParams = {
+      model: this.expertPubkey,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content: this.systemPrompt,
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `File: ${file}`,
+            },
+            {
+              type: "text",
+              text: codeLines,
+              // NOTE: we're forcing the model to cache the code
+              // FIXME doesn't seem to work properly
+              // @ts-ignore
+              cache_control: {
+                type: "ephemeral",
+              },
+            },
+            {
+              type: "text",
+              text: JSON.stringify(symbol),
+            },
+          ],
+        },
+      ],
+    };
+
+    return this.askExpert(request);
+  }
+
+  /**
+   * Process a TypeScript file and generate file-level documentation
+   *
+   * @param file - File path
+   * @param code - Contents of the TypeScript file
+   * @returns Documentation object
+   */
+  public async processFile(file: string, code: string): Promise<any> {
+    debugTypescript(`Processing file: ${file}`);
+
+    // Prepend line numbers to code string
+    const codeLines = code
+      .split("\n")
+      .map((line, index) => `${index + 1}|${line}`)
+      .join("\n");
+
+    const request: ChatCompletionCreateParams = {
+      model: this.expertPubkey,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content: this.fileSystemPrompt,
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `File: ${file}`,
+            },
+            {
+              type: "text",
+              text: codeLines,
+              // @ts-ignore
+              cache_control: {
+                type: "ephemeral",
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    return this.askExpert(request);
+  }
+
+  /**
+   * Process a directory and generate directory-level documentation
+   *
+   * @param dir - Directory path
+   * @param tree - Directory tree structure
+   * @param fileSummaries - Summaries of files in the directory
+   * @returns Documentation object
+   */
+  public async processDir(
+    dir: string,
+    tree: string,
+    fileSummaries: string
+  ): Promise<any> {
+    debugTypescript(`Processing directory: ${dir}`);
+
+    const request: ChatCompletionCreateParams = {
+      model: this.expertPubkey,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content: this.dirSystemPrompt,
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Directory: ${dir}`,
+            },
+            {
+              type: "text",
+              text: `Directory structure:\n${tree}`,
+            },
+            {
+              type: "text",
+              text: `File summaries:\n${fileSummaries}`,
+            },
+          ],
+        },
+      ],
+    };
+
+    return this.askExpert(request);
   }
 
   [Symbol.dispose]() {

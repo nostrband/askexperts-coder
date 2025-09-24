@@ -6,7 +6,7 @@ import { Command } from "commander";
 import { debugCli, debugError, enableDebugAll } from "../utils/debug.js";
 import { TypeScript } from "../indexer/typescript/TypeScript.js";
 import { INDEXER_DIR } from "./index.js";
-import { DocSymbol, symbolToDoc } from "../utils/docstore.js";
+import { DocSymbol, symbolToDoc, formatGitLink } from "../utils/docstore.js";
 import { Doc } from "askexperts/docstore";
 import { extractWorkspaces } from "../utils/workspace.js";
 
@@ -51,12 +51,34 @@ function getCurrentCommitHash(projectPath: string): string | undefined {
 }
 
 /**
+ * Get the git remote origin URL
+ * @param projectPath - Path to the project root
+ * @returns Git remote origin URL or undefined if not available
+ */
+function getGitRemoteOrigin(projectPath: string): string | undefined {
+  try {
+    const result = execSync("git remote get-url origin", {
+      cwd: projectPath,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return result.trim();
+  } catch (error) {
+    debugError(
+      `Failed to get git remote origin: ${(error as Error).message}`
+    );
+    return undefined;
+  }
+}
+
+/**
  * Create a Doc object for an included file
  * @param filePath - Relative path to the file from project root
  * @param content - File content
  * @param always - Whether to mark as 'include: always'
  * @param commitHash - Optional commit hash
  * @param workspaceRelativePath - Optional workspace relative path for monorepos
+ * @param gitOrigin - Optional git remote origin URL
  * @returns Doc object
  */
 function createIncludedDoc(
@@ -64,7 +86,8 @@ function createIncludedDoc(
   content: string,
   always?: boolean,
   commitHash?: string,
-  workspaceRelativePath?: string
+  workspaceRelativePath?: string,
+  gitOrigin?: string
 ): Doc {
   const timestamp = Math.floor(Date.now() / 1000);
 
@@ -81,6 +104,10 @@ function createIncludedDoc(
   metadata += `file: ${filePath}`;
   if (commitHash) {
     metadata += `\ncommit: ${commitHash}`;
+  }
+  if (gitOrigin && commitHash) {
+    const gitLink = formatGitLink(gitOrigin, commitHash, filePath);
+    metadata += `\nlink: ${gitLink}`;
   }
 
   const doc: Doc = {
@@ -168,6 +195,7 @@ function expandFileMask(basePath: string, pattern: string): string[] {
  * @param outputFilePath - Optional output file path
  * @param outputDirPath - Optional output directory path
  * @param workspaceRelativePath - Optional workspace relative path for monorepos
+ * @param gitOrigin - Optional git remote origin URL
  * @returns Number of processed files
  */
 async function handleIncludedFiles(
@@ -179,7 +207,8 @@ async function handleIncludedFiles(
   commitHash?: string,
   outputFilePath?: string,
   outputDirPath?: string,
-  workspaceRelativePath?: string
+  workspaceRelativePath?: string,
+  gitOrigin?: string
 ): Promise<number> {
   let processedCount = 0;
 
@@ -276,7 +305,8 @@ async function handleIncludedFiles(
         content,
         isAlwaysFile,
         commitHash,
-        workspaceRelativePath
+        workspaceRelativePath,
+        gitOrigin
       );
 
       if (outputFilePath) {
@@ -440,12 +470,15 @@ function generateFileTree(
  * Create a synthetic document containing the project file tree
  * @param packagePath - Path to the package root
  * @param workspaceRelativePath - Optional workspace relative path for monorepos
+ * @param commitHash - Optional commit hash
+ * @param gitOrigin - Optional git remote origin URL
  * @returns Doc object for the project files
  */
 function createProjectFilesDoc(
   packagePath: string,
   workspaceRelativePath?: string,
-  commitHash?: string
+  commitHash?: string,
+  gitOrigin?: string
 ): Doc {
   const timestamp = Math.floor(Date.now() / 1000);
 
@@ -470,6 +503,12 @@ function createProjectFilesDoc(
   }
   if (commitHash) {
     metadata += `commit: ${commitHash}\n`;
+  }
+  if (gitOrigin && commitHash) {
+    // For project files, link to the root directory
+    const dirPath = workspaceRelativePath || "";
+    const gitLink = formatGitLink(gitOrigin, commitHash, dirPath);
+    metadata += `link: ${gitLink}\n`;
   }
 
   const doc: Doc = {
@@ -557,6 +596,14 @@ async function processDocs(
     }
     debugCli(`Current commit hash: ${currentCommitHash}`);
 
+    // Get git remote origin URL
+    const gitOrigin = getGitRemoteOrigin(absolutePath);
+    if (gitOrigin) {
+      debugCli(`Git remote origin: ${gitOrigin}`);
+    } else {
+      debugCli("No git remote origin found");
+    }
+
     // Handle included files (both always and include) for the root project first
     debugCli(`Processing included files for project root`);
     const rootIncludedCount = await handleIncludedFiles(
@@ -568,7 +615,8 @@ async function processDocs(
       currentCommitHash, // use current commit hash
       outputFilePath,
       outputDirPath,
-      undefined // no workspace path for root
+      undefined, // no workspace path for root
+      gitOrigin
     );
     debugCli(`Processed ${rootIncludedCount} included files for project root`);
 
@@ -577,7 +625,8 @@ async function processDocs(
     const projectFilesDoc = createProjectFilesDoc(
       absolutePath,
       undefined,
-      currentCommitHash
+      currentCommitHash,
+      gitOrigin
     );
 
     if (outputFilePath) {
@@ -618,7 +667,8 @@ async function processDocs(
           outputFilePath,
           outputDirPath,
           options,
-          currentCommitHash
+          currentCommitHash,
+          gitOrigin
         );
       }
     } else {
@@ -630,7 +680,8 @@ async function processDocs(
         outputFilePath,
         outputDirPath,
         options,
-        currentCommitHash
+        currentCommitHash,
+        gitOrigin
       );
     }
   } catch (error) {
@@ -655,7 +706,8 @@ async function processWorkspace(
     include?: string[];
     docs?: string;
   },
-  currentCommitHash?: string
+  currentCommitHash?: string,
+  gitOrigin?: string
 ): Promise<void> {
   const workspaceRelativePath = path.relative(rootProjectPath, workspacePath);
   const isMonorepo = workspaceRelativePath !== "";
@@ -727,7 +779,8 @@ async function processWorkspace(
       currentCommitHash, // use current commit hash for consistency
       outputFilePath,
       outputDirPath,
-      isMonorepo ? workspaceRelativePath : undefined
+      isMonorepo ? workspaceRelativePath : undefined,
+      gitOrigin
     );
     debugCli(`Processed ${includedProcessedCount} included files`);
   } else {
@@ -771,8 +824,12 @@ async function processWorkspace(
 
           for (const line of lines) {
             if (!line.trim()) continue;
-            const symbolInfo = JSON.parse(line) as DocSymbol;
-            symbolInfos.push(symbolInfo);
+            const docEntry = JSON.parse(line) as { type?: string };
+            // Only process symbol entries, skip file/dir entries
+            if (!docEntry.type || docEntry.type === "symbol") {
+              const symbolInfo = docEntry as DocSymbol;
+              symbolInfos.push(symbolInfo);
+            }
           }
 
           // Add each symbol to the map using its hash as key
@@ -828,7 +885,8 @@ async function processWorkspace(
         allSymbolInfos,
         typescript,
         docsCommitHash, // use docs commit hash for symbol docs (they were generated from that commit)
-        isMonorepo ? workspaceRelativePath : undefined
+        isMonorepo ? workspaceRelativePath : undefined,
+        gitOrigin
       );
 
       if (outputFilePath) {
@@ -858,11 +916,159 @@ async function processWorkspace(
     }
   }
 
+  // After symbol docs are prepared, process file/dir docs
+  debugCli(`Processing file and directory documentation...`);
+  const fileDirProcessedCount = await processFileAndDirDocs(
+    docsPath,
+    outputFilePath,
+    outputDirPath,
+    docsCommitHash || currentCommitHash,
+    isMonorepo ? workspaceRelativePath : undefined,
+    gitOrigin
+  );
+
   debugCli(`Workspace preparation complete.`);
   debugCli(
-    `Processed ${includedProcessedCount} included files and ${processedSymbols} symbols (${foundSymbols} found, ${missingSymbols} missing).`
+    `Processed ${includedProcessedCount} included files, ${processedSymbols} symbols (${foundSymbols} found, ${missingSymbols} missing), and ${fileDirProcessedCount} file/dir docs.`
   );
 }
+
+/**
+ * Process file and directory documentation entries
+ */
+async function processFileAndDirDocs(
+  docsPath: string,
+  outputFilePath?: string,
+  outputDirPath?: string,
+  commitHash?: string,
+  workspaceRelativePath?: string,
+  gitOrigin?: string
+): Promise<number> {
+  let processedCount = 0;
+
+  // Scan docsPath for file/dir doc entries
+  const scanForFileDirDocs = (dirPath: string) => {
+    if (!fs.existsSync(dirPath)) return;
+
+    const items = fs.readdirSync(dirPath);
+    for (const item of items) {
+      const itemPath = path.join(dirPath, item);
+      const stats = fs.statSync(itemPath);
+
+      if (stats.isDirectory()) {
+        scanForFileDirDocs(itemPath);
+      } else if (stats.isFile() && path.extname(itemPath) === ".json") {
+        try {
+          const content = fs.readFileSync(itemPath, "utf8");
+          const lines = content.trim().split("\n");
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            const docEntry = JSON.parse(line) as { type?: string; path?: string; summary?: string; details?: string };
+            
+            // Process file and dir entries
+            if (docEntry.type === "file" || docEntry.type === "dir") {
+              const doc = createFileOrDirDoc(
+                docEntry,
+                commitHash,
+                workspaceRelativePath,
+                gitOrigin
+              );
+
+              if (outputFilePath) {
+                // Append the doc to the output file
+                fs.appendFileSync(
+                  outputFilePath,
+                  "=========================\n" +
+                    doc.metadata +
+                    "\n" +
+                    doc.data +
+                    "\n\n"
+                );
+              }
+
+              if (outputDirPath) {
+                // Write each doc to a separate file using hash of doc.id for filename
+                const fileNameHash = createHash("sha256").update(doc.id).digest("hex");
+                const docFilePath = path.join(outputDirPath, `${fileNameHash}.aedoc`);
+                fs.writeFileSync(docFilePath, JSON.stringify(doc, null, 2));
+              }
+
+              processedCount++;
+              debugCli(`Processed ${docEntry.type} doc: ${docEntry.path}`);
+            }
+          }
+        } catch (error) {
+          debugError(`Error reading JSON file ${itemPath}: ${(error as Error).message}`);
+        }
+      }
+    }
+  };
+
+  scanForFileDirDocs(docsPath);
+  return processedCount;
+}
+
+/**
+ * Create a Doc instance for file or directory documentation
+ */
+function createFileOrDirDoc(
+  docEntry: { type?: string; path?: string; summary?: string; details?: string },
+  commitHash?: string,
+  workspaceRelativePath?: string,
+  gitOrigin?: string
+): Doc {
+  const timestamp = Math.floor(Date.now() / 1000);
+  
+  // Create ID with workspace prefix for monorepos
+  const baseId = docEntry.path || "";
+  const id = workspaceRelativePath
+    ? `${workspaceRelativePath}:${baseId}`
+    : baseId;
+
+  // Create metadata
+  let metadata = `type: ${docEntry.type}\n`;
+  if (workspaceRelativePath) {
+    metadata += `workspace: ${workspaceRelativePath}\n`;
+  }
+  
+  // Make path relative to project root instead of workspace
+  const pathFromRoot = workspaceRelativePath && docEntry.path
+    ? path.posix.join(workspaceRelativePath, docEntry.path)
+    : docEntry.path;
+  metadata += `path: ${pathFromRoot}`;
+  if (commitHash) {
+    metadata += `\ncommit: ${commitHash}`;
+  }
+  if (gitOrigin && commitHash && pathFromRoot) {
+    const gitLink = formatGitLink(gitOrigin, commitHash, pathFromRoot);
+    metadata += `\nlink: ${gitLink}`;
+  }
+
+  // Create content
+  let content = "";
+  if (docEntry.summary) {
+    content += `summary: ${docEntry.summary}`;
+  }
+  if (docEntry.details) {
+    content += content ? `\n\ndetails: ${docEntry.details}` : `details: ${docEntry.details}`;
+  }
+
+  const doc: Doc = {
+    id,
+    docstore_id: "", // This will be set when the document is added to a docstore
+    timestamp,
+    created_at: timestamp,
+    type: docEntry.type === "file" ? "typescript_file_doc" : "typescript_dir_doc",
+    data: content,
+    metadata,
+    embeddings: [],
+    related_ids: [],
+  };
+
+  return doc;
+}
+
 
 /**
  * Register the 'import' command to the provided commander instance

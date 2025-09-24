@@ -8,6 +8,7 @@ import { StableSymbolId, Symbol, TypeScript } from "../indexer/typescript/TypeSc
 import { TypescriptIndexer } from "../indexer/typescript/TypescriptIndexer.js";
 import { INDEXER_DIR } from "./index.js";
 import { extractWorkspaces } from "../utils/workspace.js";
+import { generateFileTree, parseGitignore } from "../utils/fileTree.js";
 
 const NWC_FILE = ".askexperts-coder.nwc";
 
@@ -378,7 +379,12 @@ async function processWorkspace(
               
               for (const line of lines) {
                 if (line.trim()) {
-                  const docSymbol = JSON.parse(line) as Symbol;
+                  const docEntry = JSON.parse(line) as { type?: string };
+                  // Skip non-symbol entries (file summaries, etc.)
+                  if (docEntry.type && docEntry.type !== "symbol")
+                    continue;
+
+                  const docSymbol = docEntry as Symbol;
                   fileCache.existingDocSymbols.set(docSymbol.id.name, docSymbol);
                   debugCli(`Loaded existing documentation for symbol: ${docSymbol.id.name}`);
                 }
@@ -409,7 +415,7 @@ async function processWorkspace(
 
       const info = {
         ...symbol,
-        ...docs
+        ...docs,
       };
 
       // Since each workspace has its own INDEXER_DIR, no need for workspace prefix
@@ -489,6 +495,237 @@ async function processWorkspace(
       // stop
       throw error;
     }
+  }
+
+  debugCli("Symbol processing complete. Starting file and directory summaries...");
+
+  // After all symbols are handled, produce per-file and per-dir summaries
+  await processFileAndDirSummaries(workspacePath, docsPath, indexer, symbolInfos, options);
+
+  debugCli("File and directory summaries complete.");
+}
+
+/**
+ * Process file and directory summaries after symbol processing
+ */
+async function processFileAndDirSummaries(
+  workspacePath: string,
+  docsPath: string,
+  indexer: TypescriptIndexer,
+  symbolInfos: (Symbol & { parentId?: StableSymbolId })[],
+  options: { debug?: boolean; nwc?: string; name?: string; continue?: boolean; threads?: number; branch?: string; dir?: string; maxAmount?: number }
+): Promise<void> {
+  // Collect unique file names from all symbols
+  const uniqueFiles = new Set<string>();
+  const uniquePaths = new Set<string>();
+
+  // Extract file paths from symbolInfos
+  for (const symbol of symbolInfos) {
+    if (symbol.id && symbol.id.file) {
+      uniqueFiles.add(symbol.id.file);
+    }
+  }
+
+  debugCli(`Found ${uniqueFiles.size} unique files from symbols`);
+
+  // Always add the workspace root directory
+  uniquePaths.add("/"); // Workspace root
+
+  // Extract directory paths from file paths and add to the set
+  for (const filePath of uniqueFiles) {
+    uniquePaths.add(filePath); // Add the file itself
+
+    // Add all parent directories
+    let dirPath = path.dirname(filePath);
+    while (dirPath !== "." && dirPath !== "/" && dirPath !== "") {
+      uniquePaths.add(dirPath + "/"); // Add trailing / to distinguish dirs from files
+      dirPath = path.dirname(dirPath);
+    }
+  }
+
+  // Sort unique paths by length desc to process leaves of the tree first
+  const sortedPaths = Array.from(uniquePaths).sort((a, b) => b.length - a.length);
+  debugCli(`Processing ${sortedPaths.length} paths (files and directories)`);
+
+  // Process each path
+  for (const pathItem of sortedPaths) {
+    const isDirectory = pathItem.endsWith("/");
+    const cleanPath = isDirectory ? pathItem.slice(0, -1) : pathItem;
+
+    if (isDirectory) {
+      await processDirectorySummary(workspacePath, docsPath, cleanPath, indexer, options);
+    } else {
+      await processFileSummary(workspacePath, docsPath, cleanPath, indexer, options);
+    }
+  }
+}
+
+/**
+ * Process a single file summary
+ */
+async function processFileSummary(
+  workspacePath: string,
+  docsPath: string,
+  filePath: string,
+  indexer: TypescriptIndexer,
+  options: { continue?: boolean }
+): Promise<void> {
+  const outputFile = path.join(docsPath, filePath + ".json");
+
+  // Check if --continue option is given and file already has "type":"file" line
+  if (options.continue && fs.existsSync(outputFile)) {
+    try {
+      const content = fs.readFileSync(outputFile, "utf8");
+      if (content.includes('"type":"file"')) {
+        debugCli(`Skipping file summary for ${filePath} (already exists)`);
+        return;
+      }
+    } catch (error) {
+      debugError(`Error checking existing file ${outputFile}: ${(error as Error).message}`);
+    }
+  }
+
+  debugCli(`Processing file summary for: ${filePath}`);
+
+  try {
+    // Read the file content
+    const fullFilePath = path.join(workspacePath, filePath);
+    if (!fs.existsSync(fullFilePath)) {
+      debugError(`File not found: ${fullFilePath}`);
+      return;
+    }
+
+    const fileContent = fs.readFileSync(fullFilePath, "utf8");
+    
+    // Process the file with TypescriptIndexer
+    const result = await indexer.processFile(filePath, fileContent);
+    
+    // Merge with metadata and write to output
+    const fileDoc = {
+      ...result,
+      type: "file",
+      path: filePath
+    };
+
+    // Ensure the directory structure exists before writing
+    const outputDir = path.dirname(outputFile);
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+
+    fs.appendFileSync(outputFile, JSON.stringify(fileDoc) + "\n");
+    debugCli(`File summary appended to: ${outputFile}`);
+  } catch (error) {
+    debugError(`Error processing file summary for ${filePath}: ${(error as Error).message}`);
+  }
+}
+
+/**
+ * Process a single directory summary
+ */
+async function processDirectorySummary(
+  workspacePath: string,
+  docsPath: string,
+  dirPath: string,
+  indexer: TypescriptIndexer,
+  options: { continue?: boolean }
+): Promise<void> {
+  // Handle workspace root case where dirPath is "/"
+  const normalizedDirPath = dirPath === "/" ? "" : dirPath;
+  const outputFile = normalizedDirPath
+    ? path.join(docsPath, normalizedDirPath, "summary.json")
+    : path.join(docsPath, "summary.json");
+
+  // Check if --continue option is given and summary.json already has "type":"dir" line
+  if (options.continue && fs.existsSync(outputFile)) {
+    try {
+      const content = fs.readFileSync(outputFile, "utf8");
+      if (content.includes('"type":"dir"')) {
+        debugCli(`Skipping directory summary for ${dirPath} (already exists)`);
+        return;
+      }
+    } catch (error) {
+      debugError(`Error checking existing directory summary ${outputFile}: ${(error as Error).message}`);
+    }
+  }
+
+  debugCli(`Processing directory summary for: ${dirPath}`);
+
+  try {
+    // Read all json files in the matching sub-dir in docsPath (1 level - no recursion)
+    const dirDocsPath = normalizedDirPath
+      ? path.join(docsPath, normalizedDirPath)
+      : docsPath;
+    const fileSummaries: any[] = [];
+
+    if (fs.existsSync(dirDocsPath)) {
+      const items = fs.readdirSync(dirDocsPath);
+      for (const item of items) {
+        const itemPath = path.join(dirDocsPath, item);
+        const stats = fs.statSync(itemPath);
+
+        if (stats.isFile() && path.extname(itemPath) === ".json" && item !== "summary.json") {
+          try {
+            const content = fs.readFileSync(itemPath, "utf8");
+            const jsonData = JSON.parse(content);
+            if (jsonData.type === "file") {
+              fileSummaries.push(jsonData);
+            }
+          } catch (error) {
+            debugError(`Error reading file summary ${itemPath}: ${(error as Error).message}`);
+          }
+        } else if (stats.isDirectory()) {
+          // Scan sub-dirs for summary.json files
+          const subDirSummaryPath = path.join(itemPath, "summary.json");
+          if (fs.existsSync(subDirSummaryPath)) {
+            try {
+              const content = fs.readFileSync(subDirSummaryPath, "utf8");
+              const jsonData = JSON.parse(content);
+              if (jsonData.type === "dir") {
+                fileSummaries.push(jsonData);
+              }
+            } catch (error) {
+              debugError(`Error reading directory summary ${subDirSummaryPath}: ${(error as Error).message}`);
+            }
+          }
+        }
+      }
+    }
+
+    // Generate file tree for the source directory
+    const sourceDirPath = normalizedDirPath
+      ? path.join(workspacePath, normalizedDirPath)
+      : workspacePath;
+    let tree = "";
+    if (fs.existsSync(sourceDirPath)) {
+      const gitignorePath = path.join(workspacePath, ".gitignore");
+      const gitignorePatterns = parseGitignore(gitignorePath);
+      tree = generateFileTree(sourceDirPath, gitignorePatterns);
+    }
+
+    // Prepare summaries text
+    const summariesText = fileSummaries.map(summary => JSON.stringify(summary)).join("\n");
+
+    // Process the directory with TypescriptIndexer
+    const result = await indexer.processDir(dirPath, tree, summariesText);
+    
+    // Merge with metadata and write to output
+    const dirDoc = {
+      ...result,
+      type: "dir",
+      path: dirPath === "/" ? "/" : dirPath + "/"
+    };
+
+    // Ensure the directory structure exists before writing
+    const outputDir = path.dirname(outputFile);
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+
+    fs.writeFileSync(outputFile, JSON.stringify(dirDoc) + "\n");
+    debugCli(`Directory summary written to: ${outputFile}`);
+  } catch (error) {
+    debugError(`Error processing directory summary for ${dirPath}: ${(error as Error).message}`);
   }
 }
 
