@@ -1333,7 +1333,8 @@ export class TypeScript {
               addRow(member.name ?? member, member, node);
             } else if (ts.isPropertySignature(member)) {
               // Accept Identifier | StringLiteral | NumericLiteral | ComputedPropertyName
-              const nameNode = member.name ?? member;
+              // Always use member.name for property signatures, fallback to member only if name is undefined
+              const nameNode = member.name ? member.name : member;
               addRow(nameNode, member, node);
             } else if (ts.isIndexSignatureDeclaration(member)) {
               // Optional: include index signatures as well

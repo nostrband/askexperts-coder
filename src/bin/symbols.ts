@@ -41,7 +41,8 @@ function listAllSymbolsForWorkspace(workspacePath: string, rootProjectPath: stri
   const printedSymbols = new Set<string>();
   const print = (s: Symbol, offset: number = 0) => {
     // Prevent infinite recursion by tracking printed symbols
-    const symbolKey = `${s.id.file}:${s.id.name}:${s.id.kind}:${s.id.overloadIndex}`;
+    // Include start position to make the key unique for each symbol
+    const symbolKey = `${s.id.file}:${s.start}:${s.id.name}:${s.id.kind}:${s.id.overloadIndex}`;
     if (printedSymbols.has(symbolKey)) {
       debugTypescript(`Circular reference detected in symbol hierarchy: ${s.id.name} at ${s.id.file}`);
       // console.log(`${" ".repeat(offset)}[CIRCULAR REFERENCE: ${s.id.name}]`);
