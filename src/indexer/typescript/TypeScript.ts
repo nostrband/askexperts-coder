@@ -1140,8 +1140,9 @@ export class TypeScript {
    * - Includes class members (methods/fields/accessors/index signatures/constructors).
    * - Includes interface/type-literal members and members of object literals in exported consts.
    * - Attaches documentation/tags, declaration header text, stable id, parent/children relations.
+   * - Returns the list of root symbols, with children tree under each root.
    */
-  listAllSymbols() {
+  listRootSymbols() {
     // Create a symbol map to track parent-child relationships
     const symbolMap = new Map<ts.Node, Symbol>();
     const rootSymbols: Symbol[] = [];

@@ -6,22 +6,22 @@ import { extractWorkspaces } from "../utils/workspace.js";
 import path from "path";
 import fs from "fs";
 
-export function listAllSymbols(projectPath: string) {
+export function listAllSymbols(projectPath: string, showHash?: boolean) {
   // Check if this is a monorepo with workspaces
   const workspaces = extractWorkspaces(projectPath);
   
   if (workspaces.length > 0) {
     // Process each workspace
     for (const workspace of workspaces) {
-      listAllSymbolsForWorkspace(workspace.path, projectPath);
+      listAllSymbolsForWorkspace(workspace.path, projectPath, showHash);
     }
   } else {
     // Process as a single package
-    listAllSymbolsForWorkspace(projectPath, projectPath);
+    listAllSymbolsForWorkspace(projectPath, projectPath, showHash);
   }
 }
 
-function listAllSymbolsForWorkspace(workspacePath: string, rootProjectPath: string) {
+function listAllSymbolsForWorkspace(workspacePath: string, rootProjectPath: string, showHash?: boolean) {
   // Check if tsconfig.json or deno.json exists in this workspace
   const tsconfigPath = path.join(workspacePath, 'tsconfig.json');
   const denoJsonPath = path.join(workspacePath, 'deno.json');
@@ -32,7 +32,8 @@ function listAllSymbolsForWorkspace(workspacePath: string, rootProjectPath: stri
   }
   
   const parser = new TypeScript(workspacePath);
-  const symbols = parser.listAllSymbols();
+  const symbols = parser.listRootSymbols();
+  debugTypescript(`Workspace ${workspacePath} root symbols ${symbols.length}`);
   
   // Calculate the relative path from root project to this workspace
   const workspaceRelativePath = path.relative(rootProjectPath, workspacePath);
@@ -44,7 +45,7 @@ function listAllSymbolsForWorkspace(workspacePath: string, rootProjectPath: stri
     // Include start position to make the key unique for each symbol
     const symbolKey = `${s.id.file}:${s.start}:${s.id.name}:${s.id.kind}:${s.id.overloadIndex}`;
     if (printedSymbols.has(symbolKey)) {
-      debugTypescript(`Circular reference detected in symbol hierarchy: ${s.id.name} at ${s.id.file}`);
+      // debugTypescript(`Circular reference detected in symbol hierarchy: ${s.id.name} at ${s.id.file}`);
       // console.log(`${" ".repeat(offset)}[CIRCULAR REFERENCE: ${s.id.name}]`);
       return;
     }
@@ -65,7 +66,7 @@ function listAllSymbolsForWorkspace(workspacePath: string, rootProjectPath: stri
         s.id.kind
       }:${s.id.overloadIndex} rel: ${related
         .map((r) => parser.buildStableId(r.symbol)?.name)
-        .join(",")}` //  ${JSON.stringify(s.id)}
+        .join(",")}${showHash ? ` h: ${s.id.hash}` : ''}` //  ${JSON.stringify(s.id)}
     );
     for (const c of s.children || []) {
       print(c, offset + 2);
@@ -78,7 +79,7 @@ function listAllSymbolsForWorkspace(workspacePath: string, rootProjectPath: stri
 
 async function processSymbols(
   tsConfigPath: string,
-  options: { debug?: boolean; ts_config_path?: string }
+  options: { debug?: boolean; ts_config_path?: string, hash?: boolean }
 ): Promise<void> {
   // Enable debug output if debug flag is set
   if (options.debug) {
@@ -86,7 +87,7 @@ async function processSymbols(
   }
 
   try {
-    listAllSymbols(tsConfigPath);
+    listAllSymbols(tsConfigPath, options.hash);
   } catch (error) {
     debugError(`Error processing project: ${(error as Error).message}`);
     if (options.debug) {
@@ -107,5 +108,6 @@ export function registerSymbolsCommand(program: Command): void {
     .description("Process a TypeScript package and print all symbols")
     .argument("<package_path>", "Path to the package")
     .option("-d, --debug", "Enable debug output")
+    .option("--hash", "Show symbol id hashes")
     .action(processSymbols);
 }

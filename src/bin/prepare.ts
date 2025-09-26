@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { Command } from "commander";
 import { debugCli, debugError, enableDebugAll } from "../utils/debug.js";
-import { TypeScript } from "../indexer/typescript/TypeScript.js";
+import { TypeScript, Symbol as TSSymbol } from "../indexer/typescript/TypeScript.js";
 import { INDEXER_DIR } from "./index.js";
 import { DocSymbol, symbolToDoc, formatGitLink } from "../utils/docstore.js";
 import { Doc } from "askexperts/docstore";
@@ -791,6 +791,42 @@ async function processWorkspace(
 
   // Note: project_files doc is now created at project root level, not per workspace
 
+  /**
+   * Flatten a tree of symbols into a plain list
+   * @param symbols - Array of root symbols with potential children
+   * @returns Flat array of all symbols (roots + children + grandchildren, etc.)
+   */
+  const flattenSymbolTree = (symbols: TSSymbol[]): TSSymbol[] => {
+    const flattened: TSSymbol[] = [];
+    const visited = new Set<string>(); // Track by symbol hash to avoid duplicates
+    
+    const traverse = (symbol: TSSymbol) => {
+      // Use the symbol's hash as a unique identifier to prevent duplicates
+      const symbolKey = symbol.id.hash;
+      if (visited.has(symbolKey)) {
+        return; // Skip if we've already processed this symbol
+      }
+      visited.add(symbolKey);
+      
+      // Add the current symbol to the flattened list
+      flattened.push(symbol);
+      
+      // Recursively process children
+      if (symbol.children && symbol.children.length > 0) {
+        for (const child of symbol.children) {
+          traverse(child);
+        }
+      }
+    };
+    
+    // Start traversal from all root symbols
+    for (const rootSymbol of symbols) {
+      traverse(rootSymbol);
+    }
+    
+    return flattened;
+  };
+
   // Track statistics
   let processedSymbols = 0;
   let foundSymbols = 0;
@@ -798,8 +834,12 @@ async function processWorkspace(
 
   // Get all symbols from TypeScript analysis
   debugCli(`Getting all symbols from TypeScript analysis...`);
-  const allSymbols = typescript.listAllSymbols();
-  debugCli(`Found ${allSymbols.length} symbols from TypeScript analysis`);
+  const rootSymbols = typescript.listRootSymbols();
+  debugCli(`Found ${rootSymbols.length} root symbols from TypeScript analysis`);
+  
+  // Flatten the symbol tree to get all symbols (including children)
+  const allSymbols = flattenSymbolTree(rootSymbols);
+  debugCli(`Flattened to ${allSymbols.length} total symbols (including children)`);
 
   // Create a map of all available DocSymbols from JSON files for quick lookup
   const docSymbolMap = new Map<
