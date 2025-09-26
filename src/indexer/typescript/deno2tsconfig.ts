@@ -20,8 +20,30 @@ const denoDefaults: Record<string, unknown> = {
   useDefineForClassFields: true,
   forceConsistentCasingInFileNames: true,
   skipLibCheck: true,
-  lib: ["esnext", "dom", "dom.iterable"],
+  lib: ["es2024", "dom", "dom.iterable"],
 };
+
+// Deno-specific compiler options that should be filtered out when converting to tsconfig.json
+const denoOnlyOptions = new Set([
+  'jsxImportSourceTypes',
+  'lib', // Deno lib contains Deno-specific values like "deno.ns" that TypeScript doesn't understand
+  // Add other Deno-specific options here as needed
+]);
+
+/**
+ * Filter out Deno-specific compiler options that TypeScript doesn't support
+ * @param options - Compiler options object
+ * @returns Filtered compiler options
+ */
+function filterDenoOnlyOptions(options: Record<string, unknown>): Record<string, unknown> {
+  const filtered: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(options)) {
+    if (!denoOnlyOptions.has(key)) {
+      filtered[key] = value;
+    }
+  }
+  return filtered;
+}
 
 /**
  * Convert deno.json configuration to tsconfig.json format
@@ -37,10 +59,15 @@ export function denoConfigToTsConfig(denoConfigText: string): string {
     console.warn("Failed to parse deno.json, using defaults only:", error);
   }
 
+  // Filter out Deno-specific options from user config
+  const filteredUserOptions = userConfig.compilerOptions
+    ? filterDenoOnlyOptions(userConfig.compilerOptions)
+    : {};
+
   // Merge compilerOptions
   const compilerOptions = {
     ...denoDefaults,
-    ...(userConfig.compilerOptions ?? {}),
+    ...filteredUserOptions,
   };
 
   // Construct tsconfig.json structure

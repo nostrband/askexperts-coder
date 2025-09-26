@@ -1,6 +1,6 @@
 {
   "name": "askexperts-coder",
-  "version": "1.0.24",
+  "version": "1.0.26",
   "description": "Convert code to RAG for AI experts",
   "license": "MIT",
   "author": "",
@@ -18,10 +18,10 @@
   },
   "dependencies": {
     "@noble/hashes": "^1.8.0",
-    "askexperts": "^0.7.132",
+    "askexperts": "^0.7.137",
     "commander": "^11.0.0",
     "debug": "^4.4.1",
-    "nostr-tools": "^2.16.2",
+    "nostr-tools": "^2.15.0",
     "openai": "^5.16.0"
   },
   "devDependencies": {
