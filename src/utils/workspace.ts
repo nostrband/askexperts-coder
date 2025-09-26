@@ -8,8 +8,12 @@ export interface WorkspaceInfo {
 
 /**
  * Extract workspace paths from a project directory.
- * Supports both package.json workspaces and pnpm-workspace.yaml.
- * 
+ * Supports multiple workspace configuration formats:
+ * - package.json workspaces (array format): "workspaces": ["packages/*"]
+ * - package.json workspaces (object format): "workspaces": { "packages": ["packages/*"] }
+ * - deno.json workspaces: "workspace": ["packages/*"]
+ * - pnpm-workspace.yaml: packages: - "packages/*"
+ *
  * @param projectPath - Path to the project root
  * @returns Array of workspace paths, or empty array if no workspaces found
  */
@@ -23,13 +27,29 @@ export function extractWorkspaces(projectPath: string): WorkspaceInfo[] {
     try {
       const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
       if (packageJson.workspaces) {
-        const workspacePatterns = Array.isArray(packageJson.workspaces)
-          ? packageJson.workspaces
-          : packageJson.workspaces.packages || [];
+        let workspacePatterns: string[] = [];
+        
+        if (Array.isArray(packageJson.workspaces)) {
+          // Format: "workspaces": ["packages/*", "apps/*"]
+          workspacePatterns = packageJson.workspaces;
+        } else if (typeof packageJson.workspaces === 'object' && packageJson.workspaces !== null) {
+          // Format: "workspaces": { "packages": ["packages/*"] }
+          if (Array.isArray(packageJson.workspaces.packages)) {
+            workspacePatterns = packageJson.workspaces.packages;
+          } else {
+            console.warn(`Invalid workspaces.packages format in package.json: expected array, got ${typeof packageJson.workspaces.packages}`);
+          }
+        } else {
+          console.warn(`Invalid workspaces format in package.json: expected array or object, got ${typeof packageJson.workspaces}`);
+        }
         
         for (const pattern of workspacePatterns) {
-          const expandedPaths = expandWorkspacePattern(resolvedProjectPath, pattern);
-          workspaces.push(...expandedPaths);
+          if (typeof pattern === 'string') {
+            const expandedPaths = expandWorkspacePattern(resolvedProjectPath, pattern);
+            workspaces.push(...expandedPaths);
+          } else {
+            console.warn(`Invalid workspace pattern: expected string, got ${typeof pattern}`);
+          }
         }
       }
     } catch (error) {
@@ -79,96 +99,131 @@ export function extractWorkspaces(projectPath: string): WorkspaceInfo[] {
 }
 
 /**
- * Expand a workspace pattern (like "packages/*") to actual directory paths
+ * Expand a workspace pattern (like "packages/*" or "packages/**") to actual directory paths
  */
 function expandWorkspacePattern(projectPath: string, pattern: string): WorkspaceInfo[] {
   const workspaces: WorkspaceInfo[] = [];
   
   try {
-    // Handle simple glob patterns like "packages/*"
-    if (pattern.endsWith("/*")) {
-      const baseDir = pattern.slice(0, -2); // Remove "/*"
-      const basePath = path.resolve(projectPath, baseDir);
-      
-      if (fs.existsSync(basePath)) {
-        const entries = fs.readdirSync(basePath, { withFileTypes: true });
+    // Handle glob patterns like "packages/*" and "packages/**"
+    if (pattern.includes("*")) {
+      if (pattern.endsWith("/*")) {
+        // Single level: "packages/*"
+        const baseDir = pattern.slice(0, -2); // Remove "/*"
+        const basePath = path.resolve(projectPath, baseDir);
         
-        for (const entry of entries) {
-          if (entry.isDirectory()) {
-            const fullPath = path.join(basePath, entry.name);
-            
-            // Check if this directory has a package.json or deno.json (indicating it's a package)
-            const packageJsonPath = path.join(fullPath, "package.json");
-            const denoJsonPath = path.join(fullPath, "deno.json");
-            
-            if (fs.existsSync(packageJsonPath)) {
-              let name: string | undefined;
-              try {
-                const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
-                name = packageJson.name;
-              } catch {
-                // Ignore parsing errors for individual package.json files
+        if (fs.existsSync(basePath)) {
+          const entries = fs.readdirSync(basePath, { withFileTypes: true });
+          
+          for (const entry of entries) {
+            if (entry.isDirectory()) {
+              const fullPath = path.join(basePath, entry.name);
+              const workspace = createWorkspaceInfo(fullPath);
+              if (workspace) {
+                workspaces.push(workspace);
               }
-              
-              workspaces.push({
-                path: fullPath,
-                name
-              });
-            } else if (fs.existsSync(denoJsonPath)) {
-              let name: string | undefined;
-              try {
-                const denoJson = JSON.parse(fs.readFileSync(denoJsonPath, "utf8"));
-                name = denoJson.name;
-              } catch {
-                // Ignore parsing errors for individual deno.json files
-              }
-              
-              workspaces.push({
-                path: fullPath,
-                name
-              });
             }
           }
+        }
+      } else if (pattern.endsWith("/**")) {
+        // Recursive: "packages/**"
+        const baseDir = pattern.slice(0, -3); // Remove "/**"
+        const basePath = path.resolve(projectPath, baseDir);
+        
+        if (fs.existsSync(basePath)) {
+          const recursiveWorkspaces = findWorkspacesRecursively(basePath);
+          workspaces.push(...recursiveWorkspaces);
+        }
+      } else {
+        // Other glob patterns - for now, treat as exact path
+        console.warn(`Unsupported glob pattern: ${pattern}. Treating as exact path.`);
+        const fullPath = path.resolve(projectPath, pattern);
+        const workspace = createWorkspaceInfo(fullPath);
+        if (workspace) {
+          workspaces.push(workspace);
         }
       }
     } else {
       // Handle exact paths (no wildcards)
       const fullPath = path.resolve(projectPath, pattern);
-      const packageJsonPath = path.join(fullPath, "package.json");
-      const denoJsonPath = path.join(fullPath, "deno.json");
-      
-      if (fs.existsSync(packageJsonPath)) {
-        let name: string | undefined;
-        try {
-          const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
-          name = packageJson.name;
-        } catch {
-          // Ignore parsing errors for individual package.json files
-        }
-        
-        workspaces.push({
-          path: fullPath,
-          name
-        });
-      } else if (fs.existsSync(denoJsonPath)) {
-        let name: string | undefined;
-        try {
-          const denoJson = JSON.parse(fs.readFileSync(denoJsonPath, "utf8"));
-          name = denoJson.name;
-        } catch {
-          // Ignore parsing errors for individual deno.json files
-        }
-        
-        workspaces.push({
-          path: fullPath,
-          name
-        });
+      const workspace = createWorkspaceInfo(fullPath);
+      if (workspace) {
+        workspaces.push(workspace);
       }
     }
   } catch (error) {
     console.warn(`Failed to expand workspace pattern "${pattern}": ${error}`);
   }
 
+  return workspaces;
+}
+
+/**
+ * Create a WorkspaceInfo object for a given path if it contains a valid package
+ */
+function createWorkspaceInfo(fullPath: string): WorkspaceInfo | null {
+  const packageJsonPath = path.join(fullPath, "package.json");
+  const denoJsonPath = path.join(fullPath, "deno.json");
+  
+  if (fs.existsSync(packageJsonPath)) {
+    let name: string | undefined;
+    try {
+      const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+      name = packageJson.name;
+    } catch {
+      // Ignore parsing errors for individual package.json files
+    }
+    
+    return {
+      path: fullPath,
+      name
+    };
+  } else if (fs.existsSync(denoJsonPath)) {
+    let name: string | undefined;
+    try {
+      const denoJson = JSON.parse(fs.readFileSync(denoJsonPath, "utf8"));
+      name = denoJson.name;
+    } catch {
+      // Ignore parsing errors for individual deno.json files
+    }
+    
+    return {
+      path: fullPath,
+      name
+    };
+  }
+  
+  return null;
+}
+
+/**
+ * Recursively find all workspaces in a directory tree
+ */
+function findWorkspacesRecursively(basePath: string): WorkspaceInfo[] {
+  const workspaces: WorkspaceInfo[] = [];
+  
+  try {
+    const entries = fs.readdirSync(basePath, { withFileTypes: true });
+    
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const fullPath = path.join(basePath, entry.name);
+        
+        // Check if this directory is a workspace
+        const workspace = createWorkspaceInfo(fullPath);
+        if (workspace) {
+          workspaces.push(workspace);
+        }
+        
+        // Recursively search subdirectories
+        const subWorkspaces = findWorkspacesRecursively(fullPath);
+        workspaces.push(...subWorkspaces);
+      }
+    }
+  } catch (error) {
+    // Ignore permission errors or other issues with specific directories
+  }
+  
   return workspaces;
 }
 
