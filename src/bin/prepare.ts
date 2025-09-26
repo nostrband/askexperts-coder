@@ -4,7 +4,10 @@ import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { Command } from "commander";
 import { debugCli, debugError, enableDebugAll } from "../utils/debug.js";
-import { TypeScript, Symbol as TSSymbol } from "../indexer/typescript/TypeScript.js";
+import {
+  TypeScript,
+  Symbol as TSSymbol,
+} from "../indexer/typescript/TypeScript.js";
 import { INDEXER_DIR } from "./index.js";
 import { DocSymbol, symbolToDoc, formatGitLink } from "../utils/docstore.js";
 import { Doc } from "askexperts/docstore";
@@ -64,9 +67,7 @@ function getGitRemoteOrigin(projectPath: string): string | undefined {
     });
     return result.trim();
   } catch (error) {
-    debugError(
-      `Failed to get git remote origin: ${(error as Error).message}`
-    );
+    debugError(`Failed to get git remote origin: ${(error as Error).message}`);
     return undefined;
   }
 }
@@ -297,7 +298,8 @@ async function handleIncludedFiles(
         } file: ${relativePath}`
       );
 
-      const content = readFileAsUtf8(fullPath);
+      let content = readFileAsUtf8(fullPath);
+
       // Always use path relative to project root for metadata
       const metadataPath = path.relative(rootProjectPath, fullPath);
       const doc = createIncludedDoc(
@@ -715,9 +717,11 @@ async function processWorkspace(
   // Check if tsconfig.json or deno.json exists in the workspace
   const tsconfigPath = path.join(workspacePath, "tsconfig.json");
   const denoJsonPath = path.join(workspacePath, "deno.json");
-  
+
   if (!fs.existsSync(tsconfigPath) && !fs.existsSync(denoJsonPath)) {
-    debugCli(`Skipping workspace ${workspacePath}: no tsconfig.json or deno.json found`);
+    debugCli(
+      `Skipping workspace ${workspacePath}: no tsconfig.json or deno.json found`
+    );
     return;
   }
 
@@ -799,7 +803,7 @@ async function processWorkspace(
   const flattenSymbolTree = (symbols: TSSymbol[]): TSSymbol[] => {
     const flattened: TSSymbol[] = [];
     const visited = new Set<string>(); // Track by symbol hash to avoid duplicates
-    
+
     const traverse = (symbol: TSSymbol) => {
       // Use the symbol's hash as a unique identifier to prevent duplicates
       const symbolKey = symbol.id.hash;
@@ -807,10 +811,10 @@ async function processWorkspace(
         return; // Skip if we've already processed this symbol
       }
       visited.add(symbolKey);
-      
+
       // Add the current symbol to the flattened list
       flattened.push(symbol);
-      
+
       // Recursively process children
       if (symbol.children && symbol.children.length > 0) {
         for (const child of symbol.children) {
@@ -818,12 +822,12 @@ async function processWorkspace(
         }
       }
     };
-    
+
     // Start traversal from all root symbols
     for (const rootSymbol of symbols) {
       traverse(rootSymbol);
     }
-    
+
     return flattened;
   };
 
@@ -836,10 +840,12 @@ async function processWorkspace(
   debugCli(`Getting all symbols from TypeScript analysis...`);
   const rootSymbols = typescript.listRootSymbols();
   debugCli(`Found ${rootSymbols.length} root symbols from TypeScript analysis`);
-  
+
   // Flatten the symbol tree to get all symbols (including children)
   const allSymbols = flattenSymbolTree(rootSymbols);
-  debugCli(`Flattened to ${allSymbols.length} total symbols (including children)`);
+  debugCli(
+    `Flattened to ${allSymbols.length} total symbols (including children)`
+  );
 
   // Create a map of all available DocSymbols from JSON files for quick lookup
   const docSymbolMap = new Map<
@@ -1006,8 +1012,13 @@ async function processFileAndDirDocs(
 
           for (const line of lines) {
             if (!line.trim()) continue;
-            const docEntry = JSON.parse(line) as { type?: string; path?: string; summary?: string; details?: string };
-            
+            const docEntry = JSON.parse(line) as {
+              type?: string;
+              path?: string;
+              summary?: string;
+              details?: string;
+            };
+
             // Process file and dir entries
             if (docEntry.type === "file" || docEntry.type === "dir") {
               const doc = createFileOrDirDoc(
@@ -1031,8 +1042,13 @@ async function processFileAndDirDocs(
 
               if (outputDirPath) {
                 // Write each doc to a separate file using hash of doc.id for filename
-                const fileNameHash = createHash("sha256").update(doc.id).digest("hex");
-                const docFilePath = path.join(outputDirPath, `${fileNameHash}.aedoc`);
+                const fileNameHash = createHash("sha256")
+                  .update(doc.id)
+                  .digest("hex");
+                const docFilePath = path.join(
+                  outputDirPath,
+                  `${fileNameHash}.aedoc`
+                );
                 fs.writeFileSync(docFilePath, JSON.stringify(doc, null, 2));
               }
 
@@ -1041,7 +1057,9 @@ async function processFileAndDirDocs(
             }
           }
         } catch (error) {
-          debugError(`Error reading JSON file ${itemPath}: ${(error as Error).message}`);
+          debugError(
+            `Error reading JSON file ${itemPath}: ${(error as Error).message}`
+          );
         }
       }
     }
@@ -1055,13 +1073,18 @@ async function processFileAndDirDocs(
  * Create a Doc instance for file or directory documentation
  */
 function createFileOrDirDoc(
-  docEntry: { type?: string; path?: string; summary?: string; details?: string },
+  docEntry: {
+    type?: string;
+    path?: string;
+    summary?: string;
+    details?: string;
+  },
   commitHash?: string,
   workspaceRelativePath?: string,
   gitOrigin?: string
 ): Doc {
   const timestamp = Math.floor(Date.now() / 1000);
-  
+
   // Create ID with workspace prefix for monorepos
   const baseId = docEntry.path || "";
   const id = workspaceRelativePath
@@ -1073,11 +1096,12 @@ function createFileOrDirDoc(
   if (workspaceRelativePath) {
     metadata += `workspace: ${workspaceRelativePath}\n`;
   }
-  
+
   // Make path relative to project root instead of workspace
-  const pathFromRoot = workspaceRelativePath && docEntry.path
-    ? path.posix.join(workspaceRelativePath, docEntry.path)
-    : docEntry.path;
+  const pathFromRoot =
+    workspaceRelativePath && docEntry.path
+      ? path.posix.join(workspaceRelativePath, docEntry.path)
+      : docEntry.path;
   metadata += `path: ${pathFromRoot}`;
   if (commitHash) {
     metadata += `\ncommit: ${commitHash}`;
@@ -1093,7 +1117,9 @@ function createFileOrDirDoc(
     content += `summary: ${docEntry.summary}`;
   }
   if (docEntry.details) {
-    content += content ? `\n\ndetails: ${docEntry.details}` : `details: ${docEntry.details}`;
+    content += content
+      ? `\n\ndetails: ${docEntry.details}`
+      : `details: ${docEntry.details}`;
   }
 
   const doc: Doc = {
@@ -1101,7 +1127,8 @@ function createFileOrDirDoc(
     docstore_id: "", // This will be set when the document is added to a docstore
     timestamp,
     created_at: timestamp,
-    type: docEntry.type === "file" ? "typescript_file_doc" : "typescript_dir_doc",
+    type:
+      docEntry.type === "file" ? "typescript_file_doc" : "typescript_dir_doc",
     data: content,
     metadata,
     embeddings: [],
@@ -1110,7 +1137,6 @@ function createFileOrDirDoc(
 
   return doc;
 }
-
 
 /**
  * Register the 'import' command to the provided commander instance
